@@ -1,0 +1,9 @@
+/bin/
+/cases/**/output/
+/cases/.prepare-*/
+/cases/.workflow-test-*/
+/cases/.accuracy-check-*/
+__pycache__/
+*.py[cod]
+*.o
+AGENTS.md

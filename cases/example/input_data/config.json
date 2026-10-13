@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "title": "Small halite dissolution example",
+  "mesh": {
+    "nx": 16,
+    "ny": 8,
+    "spacing_m": 1e-05,
+    "thickness_m": 1e-05
+  },
+  "physics": {
+    "temperature_C": 25.0,
+    "background_pressure_atm": 1.0,
+    "viscosity_Pa_s": 0.0018,
+    "diffusivity_m2_s": 1e-09,
+    "gravity_m_s2": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "minimum_porosity": 1e-05,
+    "chemistry_pressure_mode": "uniform",
+    "density_pressure_mode": "thermodynamic"
+  },
+  "initial_solution_mol_kg_water": {
+    "Na": 0.01,
+    "K": 0.0,
+    "Ca": 0.0,
+    "Mg": 0.0,
+    "Cl": 0.01,
+    "S": 0.0,
+    "C": 0.0
+  },
+  "boundaries": [
+    {
+      "name": "inlet",
+      "side": "west",
+      "range_m": [
+        0.0,
+        8e-05
+      ],
+      "type": "pressure",
+      "value_Pa": 0.01,
+      "solution_mol_kg_water": {
+        "Na": 0.01,
+        "K": 0.0,
+        "Ca": 0.0,
+        "Mg": 0.0,
+        "Cl": 0.01,
+        "S": 0.0,
+        "C": 0.0
+      }
+    },
+    {
+      "name": "outlet",
+      "side": "east",
+      "range_m": [
+        0.0,
+        8e-05
+      ],
+      "type": "pressure",
+      "value_Pa": 0.0,
+      "solution_mol_kg_water": {
+        "Na": 0.01,
+        "K": 0.0,
+        "Ca": 0.0,
+        "Mg": 0.0,
+        "Cl": 0.01,
+        "S": 0.0,
+        "C": 0.0
+      }
+    }
+  ],
+  "reactions": {
+    "rate_coefficients_mol_m2_s": {
+      "Halite": 0.02,
+      "Sylvite": 0.0,
+      "Carnallite": 0.0,
+      "Polyhalite": 0.0,
+      "Gypsum": 0.0,
+      "Bischofite": 0.0,
+      "Calcite": 0.0
+    },
+    "interface_model": "phaseVector",
+    "surface_blocking": true,
+    "nucleation_seed": 2024,
+    "nucleation": [],
+    "product_layer": {
+      "model": "impermeable",
+      "porosity": 0.35,
+      "tortuosity": 2.0,
+      "water_diffusivity_m2_s": 1e-09,
+      "affinity_concentration_mol_m3": 1000.0
+    }
+  },
+  "simulation": {
+    "end_time_s": 0.01,
+    "time_step_s": 0.002,
+    "adaptive_time_step": false
+  },
+  "solver": {
+    "linear_profile": "balanced",
+    "component_scheme": "upwind",
+    "flow_tolerance": 1e-05,
+    "coupling_tolerance": 1e-08,
+    "conservation_tolerance": 1e-07,
+    "kinetic_relative_tolerance": 2e-08,
+    "kinetic_absolute_tolerance": 1e-11,
+    "chemistry_threads": 1,
+    "mpi_ranks": 1,
+    "timeout_s": 100.0
+  },
+  "output": {
+    "frame_interval_s": 0.005,
+    "make_figures": true
+  }
+}
