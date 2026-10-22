@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import subprocess
+import struct
 import tempfile
 import time
 import unittest
@@ -17,6 +18,7 @@ from run import case_lock, clean_work, run_case
 from lib.case_input import default_config, input_hashes, read_inputs, read_json, result_path, validate_config
 from lib.foam_input import generate
 from lib.native_run import command
+from lib.dual_geometry import geometry_records, read_geometry
 
 
 class CaseWorkflow(unittest.TestCase):
@@ -132,6 +134,24 @@ class CaseWorkflow(unittest.TestCase):
         with self.assertRaises(ValueError):
             clean_work(case/'input_data', case/'output/run_0001')
 
+    def test_dual_geometry_survives_input_snapshot_and_generation(self):
+        config = default_config(2, 2, 1e-5)
+        config['advanced'] = {'dualMineralGeometry': True}
+        source = self.native_input(config)
+        with self.assertRaisesRegex(ValueError, 'dual_geometry.bin'):
+            read_inputs(source)
+        payload = struct.pack('<5I3d', 0x44554752, 5, 2, 2, 1, 1e-5, 1e-5, 1e-5)
+        cell = struct.pack('<IiI8dI', 1, -1, 4, 0., 0., 1., 0., 1., 1., 0., 1., 0)
+        payload += cell*4 + bytes(4*216) + struct.pack('<ddII', .1, .5, 0, 0)
+        (source/'dual_geometry.bin').write_bytes(payload)
+        case, _ = create(self.root/'dual', template=source.parent)
+        self.assertEqual(input_hashes(source), input_hashes(case/'input_data'))
+        generate(case/'input_data', self.root/'dual_generated', ranks=1)
+        self.assertEqual((self.root/'dual_generated/constant/dualGeometry.bin').read_bytes(), payload)
+        (source/'dual_geometry.bin').write_bytes(payload[:8]+struct.pack('<I', 3)+payload[12:])
+        with self.assertRaisesRegex(ValueError, 'Fine geometry must match'):
+            read_inputs(source)
+
     def test_concurrent_run_is_rejected_before_creating_output(self):
         source = self.native_input()
         case, _ = create(self.root/'case', template=source.parent)
@@ -139,6 +159,63 @@ class CaseWorkflow(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'already'):
                 run_case(case)
         self.assertEqual(list((case/'output').glob('run_*')), [])
+
+    def test_polygon_reader_preserves_holes_and_coarse_owners(self):
+        square = np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]])
+        hole = np.array([[.2, .2], [.2, .6], [.6, .2]])
+
+        def piece(phase, exterior, holes=()):
+            data = struct.pack('<iI', phase, len(exterior)) + exterior.astype('<f8').tobytes()
+            data += struct.pack('<I', len(holes))
+            for ring in holes:
+                data += struct.pack('<I', len(ring)) + ring.astype('<f8').tobytes()
+            return data
+
+        path = self.root/'polygons.bin'
+        payload = struct.pack('<5I3d', 0x44554752, 2, 2, 1, 2, 2e-6, 1e-6, 1e-5)
+        payload += (struct.pack('<I', 1) + piece(-1, square)) * 7
+        payload += struct.pack('<I', 2) + piece(0, square, [hole]) + piece(-1, hole[::-1])
+        path.write_bytes(payload)
+        for include_water in (True, False):
+            with geometry_records(path, include_water=include_water) as (header, records):
+                records = list(records)
+            self.assertEqual(header.fine_cells, 8)
+            self.assertEqual(len(records), 9 if include_water else 1)
+            cell, phase, rings = next(r for r in records if r[1] == 0)
+            self.assertEqual((cell, phase), (7, 0))
+            np.testing.assert_array_equal(rings[0], square)
+            np.testing.assert_array_equal(rings[1], hole)
+        cfg, polygons, phases, owners = read_geometry(path)
+        self.assertEqual(cfg[:3], (2, 1, 2))
+        np.testing.assert_array_equal(owners[phases == 0], [1, 1])
+        for actual, ring in zip((p for p, phase in zip(polygons, phases) if phase == 0), (square, hole)):
+            np.testing.assert_allclose(actual, ring + [3, 1], rtol=1e-14)
+
+    def test_polygon_reader_checks_versioned_footer_and_skipped_water(self):
+        path = self.root/'checkpoint.bin'
+        for version in range(1, 7):
+            payload = struct.pack('<5I3d', 0x44554752, version, 1, 1, 1, 1e-6, 1e-6, 1e-5)
+            payload += struct.pack('<IiI8d', 1, -1, 4, 0., 0., 1., 0., 1., 1., 0., 1.)
+            if version >= 2:
+                payload += struct.pack('<I', 0)
+            if version >= 3:
+                payload += bytes(144)
+            if version >= 4:
+                payload += bytes(72)
+            if version >= 5:
+                payload += struct.pack('<ddIIi9d', .1, .5, 1, 1, 0, 1., *([0.] * 8))
+            if version >= 6:
+                payload += struct.pack('<3d', 1e-12, -2e-12, 0.)
+            with self.subTest(version=version):
+                path.write_bytes(payload)
+                with geometry_records(path, include_water=False) as (_, records):
+                    self.assertEqual(list(records), [])
+                oversized_ring = payload[:52] + struct.pack('<I', 2**32 - 1) + payload[56:]
+                for invalid in (payload[:-1], payload + b'x', oversized_ring):
+                    path.write_bytes(invalid)
+                    with self.assertRaises(ValueError):
+                        with geometry_records(path, include_water=False) as (_, records):
+                            list(records)
 
     def test_timeout_terminates_child_process_group(self):
         late_file = self.root/'late.bin'

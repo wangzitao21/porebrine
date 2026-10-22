@@ -34,13 +34,16 @@ inline CapReactionResult advanceCapPopulations(
                 <<" caps_mol="<<amount<<" total_mol="<<cell.mineral[j]<<" excess_mol="<<amount-cell.mineral[j]
                 <<" roundoff_budget_mol="<<64*epsilon*std::max(amount,cell.mineral[j])
                 <<" cap_fraction="<<caps[j]<<" bulk_volume="<<bulkVolume;
-            for(int k=0;k<7;k++)if(surface.population[7*j+k].fraction>0)
-                message<<" population["<<k<<"]="<<surface.population[7*j+k].fraction<<" count="<<surface.population[7*j+k].count;
+            for(int k=0;k<7;k++)if(surface.population.get(7*j+k).fraction>0)
+                message<<" population["<<k<<"]="<<surface.population.get(7*j+k).fraction<<" count="<<surface.population.get(7*j+k).count;
             throw std::invalid_argument(message.str());
         }
     }
     Inventory candidate=cell;auto populations=surface;CapReactionResult result;
     for(int pair=0;pair<49;pair++){
+        if(!std::isfinite(measured.populationArea[pair])||measured.populationArea[pair]<0)
+            throw std::invalid_argument("Invalid cap reacting area");
+        if(!populations.population.find(pair))continue;
         auto& cap=populations.population[pair];const int mineral=pair/7;
         if(!std::isfinite(cap.fraction)||cap.fraction<0||!std::isfinite(cap.count)||cap.count<0||
            !std::isfinite(cap.heightFactor)||cap.heightFactor<=0||cap.heightFactor>2||
@@ -57,9 +60,10 @@ inline CapReactionResult advanceCapPopulations(
         parameters.geometry.lockedMoles.fill(0);parameters.geometry.curvatureLogOmega.fill(0);
         parameters.geometry.surfaceExponent.fill(0);parameters.referenceMoles.fill(1);
         parameters.area[mineral]=parameters.geometry.growthArea[mineral]=measured.populationArea[pair]*bulkVolume/cellVolume;
-        parameters.referenceMoles[mineral]=amount;parameters.geometry.surfaceExponent[mineral]=2./3;
+        parameters.referenceMoles[mineral]=amount;parameters.geometry.surfaceExponent[mineral]=cap.filmArea>0?0:2./3;
         const double curvatureRadius=saltgeom::radius(cap,cellVolume);
         if(!(curvatureRadius>0)||!std::isfinite(curvatureRadius))throw std::invalid_argument("Invalid active cap curvature radius");
+        if(cap.filmArea>0&&cap.interfacialEnergy>0)throw std::invalid_argument("A planar film cannot use spherical-cap curvature");
         if(cap.interfacialEnergy>0)parameters.geometry.curvatureLogOmega[mineral]=2*cap.interfacialEnergy*molarVolume[mineral]/
             (saltgeom::molarGasConstant*temperatureK*curvatureRadius);
         // Preserve the exact small active stock instead of subtracting two
@@ -75,7 +79,7 @@ inline CapReactionResult advanceCapPopulations(
         double extent=amount-reactor.mineral[mineral];
         const double activeRoundoff=64*epsilon*std::max(amount,reactor.mineral[mineral]);
         if(reactor.mineral[mineral]==0&&pureCaps[mineral]){
-            bool last=true;for(int k=0;k<7;k++)if(7*mineral+k!=pair&&populations.population[7*mineral+k].fraction>0)last=false;
+            bool last=true;for(int k=0;k<7;k++)if(7*mineral+k!=pair&&populations.population.get(7*mineral+k).fraction>0)last=false;
             // An exact final depletion consumes the actual remaining stock,
             // including its conversion ulp, with the matching aqueous/water
             // transfer. It must not leave a fake resolved mineral sliver.
@@ -122,6 +126,6 @@ inline CapReactionResult advanceCapPopulations(
             result.stats.*field+=stats.*field;
         result.stats.dissolved[mineral]+=std::max(extent,0.);result.stats.precipitated[mineral]+=std::max(-extent,0.);
     }
-    cell=candidate;surface=populations;return result;
+    cell=candidate;surface=std::move(populations);return result;
 }
 }

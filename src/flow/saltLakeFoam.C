@@ -11,6 +11,7 @@
 #include "simpleControl.H"
 #include "PhaseTransform.H"
 #include "MineralSurface.H"
+#include "DualGridSurface.H"
 #include "ThermodynamicSchedule.H"
 #include "ComponentTransport.H"
 #include "LocalChemistry.H"
@@ -224,12 +225,13 @@ int main(int argc,char** argv){
     volScalarField densityPressureDerivative(IOobject("densityPressureDerivative",runTime.timeName(),mesh),mesh,dimensionedScalar(dimDensity/dimPressure,0));
     const auto& centres=mesh.C();const double bulkVolume=gSum(mesh.V());PhaseStencil stencil(mesh,dx,dy);
     saltflow::MineralSurface mineralSurface(cfg,mesh,stencil,dx,dy,epMin);
+    saltflow::DualGridSurface dualSurface(cfg,mesh,dx,dy,epMin);
 #ifdef SALT_REFERENCE_BACKEND
-    if(mineralSurface.enabled)throw std::invalid_argument("Heterogeneous interfaces currently require the native Pitzer backend");
+    if(mineralSurface.enabled||dualSurface.enabled)throw std::invalid_argument("Explicit mineral interfaces currently require the native Pitzer backend");
 #endif
     int invalidInitial=0;
     forAll(eps,i){
-        double phase=eps[i]+inert[i],sumY=0;
+        double phase=eps[i]+inert[i]+dualSurface.closedFraction(i),sumY=0;
         bool valid=std::isfinite(eps[i])&&eps[i]>=epMin-1e-12&&eps[i]<=1&&std::isfinite(inert[i])&&inert[i]>=0&&std::isfinite(p[i]);
         for(int j=0;j<3;j++)valid=valid&&std::isfinite(U[i][j]);
         for(int j=0;j<7;j++){
@@ -240,6 +242,8 @@ int main(int argc,char** argv){
     }
     reduce(invalidInitial,maxOp<int>());
     if(invalidInitial)throw std::invalid_argument("Initial fields require finite nonnegative inventories, positive solvent, and epsilon + inert + minerals = 1");
+    mineralSurface.initializeCoating(cfg,solid,eps,inert,rateTemplate);
+    dualSurface.check(solid,inert);
     double chemistryTime=0,flowTime=0,transportTime=0,outputTime=0,initializationTime=0,flowChange=0,couplingChange=0,massResidual=0,momentumResidual=0,maxBalance=0;
     double chemicalAccepted=0,chemicalEvaluations=0,chemicalRestarts=0,chemicalFallbacks=0;
     double chemicalJacobians=0,jacobianFallbacks=0,transportAssemblies=0,positivityMass=0,equationResidual=0;
@@ -253,7 +257,7 @@ int main(int argc,char** argv){
     double boundaryPropertyEvaluations=0,boundaryPropertyHits=0;
     std::vector<saltchem::Inventory> cells(mesh.nCells());std::vector<saltchem::RateParameters> rates(mesh.nCells());
     std::vector<double> cachedPressure(mesh.nCells(),0),chemistryCost(mesh.nCells(),1),cellSeconds(mesh.nCells(),0),cellEvaluations(mesh.nCells(),0),cellRejected(mesh.nCells(),0),cellFallbacks(mesh.nCells(),0);
-    std::vector<label> workOrder(mesh.nCells());std::iota(workOrder.begin(),workOrder.end(),0);
+    std::vector<label> workOrder;workOrder.reserve(mesh.nCells());
     double skippedChemistry=0,couplingIterations=0,pressureOffset=0,eosLinearized=0,maxDensityPressureError=0,minimumUsedCouplingRelaxation=1,maxReservoirFluxError=0;
     // Preserve the small mechanical pressure across iterations. Repeatedly
     // adding/subtracting a large imposed pressure destroys its low bits.
@@ -274,7 +278,8 @@ int main(int argc,char** argv){
         pressureDeviation+=previousOffset-pressureOffset;
     };
     auto failCollectively=[&](const std::vector<std::string>& errors,const char* stage){int failed=0;for(label i=0;i<label(errors.size());i++)if(!errors[i].empty()){if(failed++<3)Pout<<stage<<" index="<<i<<" "<<errors[i]<<endl;}reduce(failed,sumOp<int>());if(failed)throw std::runtime_error(std::string(stage)+" failed in "+std::to_string(failed)+" cells/faces");};
-    auto updateReservoirs=[&](){hydraulics.updateTransport(massPhi,mineralSurface.diffusivity(D,eps,rho)(),Y);for(auto& y:Y)y.correctBoundaryConditions();};
+    auto effectiveDiffusivity=[&](){auto value=dualSurface.enabled?saltflow::diffusiveConductance((D*rho)()):mineralSurface.diffusivity(D,eps,rho);dualSurface.constrainDiffusion(value.ref());return value;};
+    auto updateReservoirs=[&](){hydraulics.updateTransport(massPhi,effectiveDiffusivity()(),Y);for(auto& y:Y)y.correctBoundaryConditions();};
     auto updateProperties=[&](bool updateCompressibility=false,bool exact=true){
         const auto propertyStart=Timer::now();
         updateReservoirs();
@@ -336,9 +341,9 @@ int main(int argc,char** argv){
         const auto geometryStart=Timer::now();mineralSurface.reconstruct(solid,inert,rateTemplate);mineralSurface.updateTransport(eps);if(mineralSurface.enabled)interfaceGeometryTime+=elapsed(geometryStart);
         const auto neighbours=stencil.values(eps);
         forAll(eps,i){auto& s=cells[i];s.waterEquivalent=eps[i]*rho[i];for(int j=0;j<7;j++){s.aqueous[j]=eps[i]*rho[i]*Y[j][i]/saltchem::componentMass[j];s.waterEquivalent-=eps[i]*rho[i]*Y[j][i];s.mineral[j]=solid[j][i]/model.molarVolume[j];}
-            auto& r=rates[i];r=rateTemplate;r.geometry.inertFraction=inert[i];r.geometry.neighbours=neighbours[i];mineralSurface.configure(i,s,r,model.molarVolume);}
+            auto& r=rates[i];r=rateTemplate;r.geometry.inertFraction=inert[i];r.geometry.neighbours=neighbours[i];mineralSurface.configure(i,s,r,model.molarVolume);dualSurface.configure(i,s,r);}
     };
-    auto inventory=[&](){std::array<double,8> a{};forAll(eps,i){const double cap=eps[i]*rho[i],v=mesh.V()[i];double sumY=0;for(int j=0;j<7;j++){sumY+=Y[j][i];a[j]+=cap*Y[j][i]*v/saltchem::componentMass[j];}a[7]+=cap*(1-sumY)*v;for(int k=0;k<7;k++){const double m=solid[k][i]*v/model.molarVolume[k];for(int j=0;j<7;j++)a[j]+=saltchem::stoichiometry[k][j]*m;a[7]+=saltchem::hydration[k]*saltchem::waterMolarMass*m;}}for(double& x:a)reduce(x,sumOp<double>());return a;};
+    auto inventory=[&](){std::array<double,8> a{};forAll(eps,i){const double cap=eps[i]*rho[i],v=mesh.V()[i];double sumY=0;for(int j=0;j<7;j++){sumY+=Y[j][i];a[j]+=cap*Y[j][i]*v/saltchem::componentMass[j];}a[7]+=cap*(1-sumY)*v;for(int k=0;k<7;k++){const double m=solid[k][i]*v/model.molarVolume[k];for(int j=0;j<7;j++)a[j]+=saltchem::stoichiometry[k][j]*m;a[7]+=saltchem::hydration[k]*saltchem::waterMolarMass*m;}}dualSurface.addClosedInventory(a,model.molarVolume);for(double& x:a)reduce(x,sumOp<double>());return a;};
     auto flowIteration=[&](bool transient,const scalarField& oldMass){
         flowSolves++;
         auto tick=Timer::now();vectorField previous(U.primitiveField());volVectorField previousVelocity("previousVelocity",U);
@@ -405,13 +410,13 @@ int main(int argc,char** argv){
         }
         ph+=rhoFace*(rAtUf-rAUf)*fvc::snGrad(p)*mesh.magSf();H-=(rAU-rAtU)*fvc::grad(p);
         forAll(U.boundaryField(),patch)if(U.boundaryField()[patch].fixesValue()&&!p.boundaryField()[patch].fixesValue())ph.boundaryFieldRef()[patch]==rho.boundaryField()[patch]*(U.boundaryField()[patch]&mesh.Sf().boundaryField()[patch]);
-        surfaceScalarField rf(rhoFace*rAtUf);constrainPressure(p,rho,U,ph,rf);
+        surfaceScalarField rf(rhoFace*rAtUf);dualSurface.constrainDiffusion(ph,true);dualSurface.constrainDiffusion(rf,true);constrainPressure(p,rho,U,ph,rf);
         volScalarField pressureStorage(eps*densityPressureDerivative/runTime.deltaT());
         if(!transient)pressureStorage=dimensionedScalar(pressureStorage.dimensions(),0);
         fvScalarMatrix pe(fvm::laplacian(rf,p)-fvm::Sp(pressureStorage,p)==fvc::div(ph)+storage-totalSource-pressureStorage*p);
         // Compressible storage fixes absolute pressure even in a closed
         // domain. Pinning one cell there would create a spurious mass source.
-        if(!transient||!pressureCompressible)pe.setReference(pressureReferenceCell,pressureReferenceValue-pressureOffset);
+        if(!transient||!pressureCompressible){if(dualSurface.enabled)dualSurface.anchorPressure(pe,p);else pe.setReference(pressureReferenceCell,pressureReferenceValue-pressureOffset);}
         pe.solve();massPhi=ph-pe.flux();phi=massPhi/rhoFace;
         p.relax(pressureRelaxation);U=H-rAtU*fvc::grad(p);pressureDeviation=p.primitiveField();shiftPressure(pressureOffset);U.correctBoundaryConditions();flowChange=gMax(mag(U.primitiveField()-previous))/max(gMax(mag(U.primitiveField())),1e-12);
         massResidual=gMax(mag((fvc::div(massPhi)+storage-totalSource)().primitiveField()));flowTime+=elapsed(tick);
@@ -472,7 +477,7 @@ int main(int argc,char** argv){
         flowTime+=elapsed(tick);return momentumResidual;
     };
     auto ledger=[&](double dt){
-        auto tick=Timer::now();surfaceScalarField deff(mineralSurface.diffusivity(D,eps,rho));double soluteSum=0,totalFlux=0;
+        auto tick=Timer::now();surfaceScalarField deff(effectiveDiffusivity());double soluteSum=0,totalFlux=0;
         for(int j=0;j<7;j++){fvScalarMatrix matrix(fvm::div(massPhi,Y[j])-fvm::laplacian(deff,Y[j]));surfaceScalarField flux(matrix.flux());maxReservoirFluxError=max(maxReservoirFluxError,hydraulics.fluxError(j,massPhi,flux,deff,Y[j]));double componentFlux=0;forAll(flux.boundaryField(),patch)if(!flux.boundaryField()[patch].coupled()&&mesh.boundary()[patch].type()!="empty")componentFlux+=sum(flux.boundaryField()[patch]);reduce(componentFlux,sumOp<double>());boundaryIntegral[j]+=dt*componentFlux/saltchem::componentMass[j];soluteSum+=componentFlux;}
         forAll(massPhi.boundaryField(),patch)if(!massPhi.boundaryField()[patch].coupled()&&mesh.boundary()[patch].type()!="empty")totalFlux+=sum(massPhi.boundaryField()[patch]);reduce(totalFlux,sumOp<double>());boundaryIntegral[7]+=dt*(totalFlux-soluteSum);
         auto now=inventory();for(int j=0;j<8;j++){const double scale=max(std::abs(initialInventory[j]),j==7?bulkVolume*1e-6:bulkVolume*1e-3);balance[j]=(now[j]-initialInventory[j]+boundaryIntegral[j])/scale;maxBalance=max(maxBalance,std::abs(balance[j]));}transportTime+=elapsed(tick);
@@ -491,7 +496,9 @@ int main(int argc,char** argv){
             failCollectively(diagnosticErrors,"SURFACE_FILM_DIAGNOSTIC");
         }
         mineralSurface.save(out);
-        auto tick=Timer::now();saltchem::MineralVector minerals{};for(int j=0;j<7;j++)minerals[j]=gSum(solid[j].primitiveField()*mesh.V())/model.molarVolume[j];const double por=gSum(eps.primitiveField()*mesh.V())/bulkVolume;
+        dualSurface.save(out);
+        dualSurface.saveReactiveWater(out,cells,localChemistry,model.temperatureK(),[&](int i){return absolutePressure(p[i],centres[i]);});
+        auto tick=Timer::now();saltchem::MineralVector minerals{};for(int j=0;j<7;j++)minerals[j]=gSum(solid[j].primitiveField()*mesh.V())/model.molarVolume[j]+dualSurface.mineralDebt(j,model.molarVolume[j]);const double por=gSum(eps.primitiveField()*mesh.V())/bulkVolume;
         auto globalPrecipitated=precipitated,globalDissolved=dissolved;for(int j=0;j<7;j++){reduce(globalPrecipitated[j],sumOp<double>());reduce(globalDissolved[j],sumOp<double>());}
         double qin=0,qout=0;forAll(phi.boundaryField(),patch)if(!mesh.boundary()[patch].coupled()&&mesh.boundary()[patch].type()!="empty")for(double q:phi.boundaryField()[patch]){qin-=min(q,0.);qout+=max(q,0.);}reduce(qin,sumOp<double>());reduce(qout,sumOp<double>());
         forAll(mesh.boundary(),patch)if(!mesh.boundary()[patch].coupled()&&mesh.boundary()[patch].type()!="empty"){
@@ -509,8 +516,9 @@ int main(int argc,char** argv){
         std::ofstream f((out/"frames"/(runTime.timeName()+".f32")).c_str(),std::ios::binary);std::uint32_t header[4]={0x53414C54,1,std::uint32_t(mesh.nCells()),33};f.write(reinterpret_cast<char*>(header),sizeof(header));
         forAll(eps,i){auto chemical=properties[i];if(densityPressureMode!="local"&&flowPressure){double water;auto& worker=localChemistry.at(model.temperatureK(),chemicalPressure[i]);chemical=worker.speciation.conserved(cells[i],water,&properties[i]);}std::array<float,33> row{};int n=0;for(double v:{centres[i].x(),centres[i].y(),eps[i],U[i].x(),U[i].y(),p[i]})row[n++]=float(v);for(int j=0;j<7;j++)row[n++]=float(solid[j][i]);row[n++]=float(inert[i]);row[n++]=float(rho[i]);for(double v:saltchem::componentTotals(chemical.molality))row[n++]=float(v);for(double v:chemical.saturationIndex)row[n++]=float(v);row[n++]=float(chemical.pH);row[n++]=float(chemical.waterActivity);
             double Q=0;saltchem::MineralVector mineralRates{};
-            if(!mineralSurface.fluidSide())mineralRates=saltchem::surfaceRates(cells[i],rates[i],chemical.saturationIndex,chemical.logActivity[saltchem::H],chemical.logActivity[saltchem::CO2],model.molarVolume,&Q);
-            if(mineralSurface.enabled){const auto q=mineralSurface.transformation(i,mineralRates,model.molarVolume);row[n++]=float(q[0]);row[n++]=float(q[1]);}
+            if(!mineralSurface.fluidSide()&&!dualSurface.enabled)mineralRates=saltchem::surfaceRates(cells[i],rates[i],chemical.saturationIndex,chemical.logActivity[saltchem::H],chemical.logActivity[saltchem::CO2],model.molarVolume,&Q);
+            if(dualSurface.enabled){row[n++]=float(dualSurface.reactionVectors[i][0]);row[n++]=float(dualSurface.reactionVectors[i][1]);}
+            else if(mineralSurface.enabled){const auto q=mineralSurface.transformation(i,mineralRates,model.molarVolume);row[n++]=float(q[0]);row[n++]=float(q[1]);}
             else{const auto qv=phaseVector(eps[i],rates[i].geometry.neighbours,dx,dy,Q);row[n++]=float(qv[1]);row[n++]=float(qv[2]);}
             f.write(reinterpret_cast<const char*>(row.data()),sizeof(row));}
         if(!f)FatalErrorInFunction<<"Snapshot write failed"<<exit(FatalError);
@@ -550,6 +558,7 @@ int main(int argc,char** argv){
     }else{
         pressureDeviation=p.primitiveField()-pressureOffset;
         U.correctBoundaryConditions();phi=fvc::flux(U);massPhi=fvc::interpolate(rho)*phi;for(auto& y:Y)y.correctBoundaryConditions();updateProperties();massPhi=fvc::interpolate(rho)*phi;loadCells();
+        dualSurface.initialize(cells,model.molarVolume,eps);loadCells();
     }
 #ifdef SALT_REFERENCE_BACKEND
     const double referenceTolerance=cfg.lookupOrDefault<scalar>("referenceKineticTolerance",1e-13);
@@ -568,7 +577,7 @@ int main(int argc,char** argv){
     for(;!restarting&&initialIterations<maxIterations;initialIterations++){
         const scalarField previous(initialPack());flowIteration(false,initialMass);for(auto& y:Y)y.correctBoundaryConditions();const scalarField previousRho(rho.primitiveField());updateProperties();
         const double densityChange=gMax(mag(rho.primitiveField()-previousRho)/rho.primitiveField());
-        if(initialIterations%100==0)Info<<"INITIAL_FLOW "<<initialIterations<<" change="<<flowChange<<endl;
+        if(initialIterations%100==0)Info<<"INITIAL_FLOW "<<initialIterations<<" change="<<flowChange<<" mass="<<massResidual<<" momentum="<<checkMomentum(false)<<endl;
         if(initialIterations>5&&flowChange<flowTol&&densityChange<couplingTol&&massResidual<1e-5&&checkMomentum(false)<flowTol)break;
         if(cfg.lookupOrDefault<bool>("accelerateInitialFlow",true)){
             const scalarField proposed(initialAccelerator.next(previous,initialPack()));
@@ -584,7 +593,8 @@ int main(int argc,char** argv){
     auto capture=[&](){
         saltflow::FlowState state(runTime,p,eps,rho,U,phi,massPhi,Y,solid);
         state.pressureDeviation=pressureDeviation;state.pressureOffset=pressureOffset;
-        state.boundaryIntegral=boundaryIntegral;state.balance=balance;state.maxBalance=maxBalance;state.dissolved=dissolved;state.precipitated=precipitated;state.mineralSurface=mineralSurface.state;state.mineralSurfaceRates=mineralSurface.reactionRates;state.mineralSurfaceVectors=mineralSurface.reactionVectors;return state;
+        state.boundaryIntegral=boundaryIntegral;state.balance=balance;state.maxBalance=maxBalance;state.dissolved=dissolved;state.precipitated=precipitated;state.mineralSurface=mineralSurface.state;state.mineralSurfaceRates=mineralSurface.reactionRates;state.mineralSurfaceVectors=mineralSurface.reactionVectors;
+        if(dualSurface.enabled){state.dualGeometry=std::make_shared<saltdual::Geometry>(dualSurface.geometry);state.dualGeometryVectors=dualSurface.reactionVectors;}return state;
     };
     auto restore=[&](const saltflow::FlowState& state){
         static_cast<TimeState&>(runTime)=state.nativeTime;
@@ -595,6 +605,7 @@ int main(int argc,char** argv){
         mineralSurface.state=state.mineralSurface;
         mineralSurface.reactionRates=state.mineralSurfaceRates;
         mineralSurface.reactionVectors=state.mineralSurfaceVectors;
+        if(state.dualGeometry){dualSurface.restore(*state.dualGeometry);dualSurface.reactionVectors=state.dualGeometryVectors;}
         std::fill(cached.begin(),cached.end(),0);
     };
     auto advanceSegment=[&](double dt){
@@ -622,6 +633,25 @@ int main(int argc,char** argv){
         try{std::vector<double> pa(mesh.nCells());forAll(p,i)pa[i]=absolutePressure(p[i],centres[i]);reference.setConditions(tp[0],tp[1]);reference.setPressures(pa);reference.setTime(runTime.value()-dt);reference.advance(cells,rates,dt);}catch(const std::exception& e){errors[0]=e.what();}
 #else
         double stepAccepted=0,stepEvaluations=0,stepRestarts=0,stepFallbacks=0,stepJacobians=0,stepJacobianFallbacks=0,stepSkipped=0;
+        auto prepareChemistryWork=[&](){
+            workOrder.clear();
+            for(label i=0;i<mesh.nCells();i++){
+                bool active;
+                if(mineralSurface.enabled)active=mineralSurface.active(i);
+                else{
+                    // Exactly the previous zero-area test, without scheduling
+                    // inert cells or sorting them with the reactive workload.
+                    bool flat=true;for(double e:rates[i].geometry.neighbours)flat=flat&&e==eps[i];
+                    active=!flat;
+                }
+                if(active)workOrder.push_back(i);
+                else{stepSkipped++;chemistryCost[i]=1;}
+            }
+            // Cell reactions are independent within this stage. A serial
+            // worker has no load imbalance to fix by sorting every time.
+            if(threads>1)std::stable_sort(workOrder.begin(),workOrder.end(),
+                [&](label a,label b){return chemistryCost[a]>chemistryCost[b];});
+        };
         auto advanceFaces=[&](double faceDt,bool precipitation){
             // Face matchings serialize every shared liquid/solid inventory.
             // Amounts use mol or kg per bulk m3, with uniform physical cell
@@ -706,16 +736,20 @@ int main(int argc,char** argv){
             const auto neighbours=stencil.values(eps);
             forAll(eps,i){rates[i]=rateTemplate;rates[i].geometry.inertFraction=inert[i];rates[i].geometry.neighbours=neighbours[i];mineralSurface.configure(i,cells[i],rates[i],model.molarVolume);}
         };
-        if(mineralSurface.fluidSide()){
+        if(dualSurface.enabled){
+            const auto result=dualSurface.advance(cells,rateTemplate,model.molarVolume,localChemistry,model.temperatureK(),
+                [&](int i){return absolutePressure(p[i],centres[i]);},dt,options);
+            stepAccepted+=result.accepted;stepEvaluations+=result.evaluations;stepRestarts+=result.restarts;
+            stepFallbacks+=result.fallbacks;stepJacobians+=result.jacobians;stepJacobianFallbacks+=result.jacobianFallbacks;
+        }else if(mineralSurface.fluidSide()){
             auto advanceLocalPart=[&](double interval,bool primary){
                 std::fill(errors.begin(),errors.end(),std::string{});
-                std::stable_sort(workOrder.begin(),workOrder.end(),[&](label a,label b){return chemistryCost[a]>chemistryCost[b];});
+                prepareChemistryWork();
                 #pragma omp parallel for schedule(dynamic,1) reduction(+:stepAccepted,stepEvaluations,stepRestarts,stepFallbacks,stepJacobians,stepJacobianFallbacks,stepSkipped)
-                for(label task=0;task<mesh.nCells();task++){
+                for(label task=0;task<label(workOrder.size());task++){
                     const label i=workOrder[task];const auto started=Timer::now();
                     const double evaluationsBefore=cellEvaluations[i];
                     try{
-                        if(!mineralSurface.active(i)){stepSkipped++;chemistryCost[i]=1;continue;}
                         auto& worker=localChemistry.at(model.temperatureK(),absolutePressure(p[i],centres[i]));
                         auto record=[&](const saltchem::IntegrationStats& stats,int filmEvaluations=0){
                             stepAccepted+=stats.accepted;stepEvaluations+=stats.rateEvaluations+filmEvaluations;stepRestarts+=stats.historyRestarts;
@@ -787,15 +821,11 @@ int main(int argc,char** argv){
             // blocked opening. This refresh performs no additional reaction.
             refreshSurfaceGeometry();
         }else{
-        std::stable_sort(workOrder.begin(),workOrder.end(),[&](label a,label b){return chemistryCost[a]>chemistryCost[b];});
+        prepareChemistryWork();
         #pragma omp parallel for schedule(dynamic,1) reduction(+:stepAccepted,stepEvaluations,stepRestarts,stepFallbacks,stepJacobians,stepJacobianFallbacks,stepSkipped)
-        for(label task=0;task<mesh.nCells();task++){
+        for(label task=0;task<label(workOrder.size());task++){
             const label i=workOrder[task];const auto cellStart=Timer::now();
             try{
-                // Exactly zero geometric area for either sign of the rate.
-                // No threshold is used: small but nonzero reactions are kept.
-                bool flat=true;for(double e:rates[i].geometry.neighbours)flat=flat&&e==eps[i];
-                if(mineralSurface.enabled?!mineralSurface.active(i):flat){stepSkipped++;chemistryCost[i]=1;continue;}
                 auto& worker=localChemistry.at(model.temperatureK(),absolutePressure(p[i],centres[i]));
                 if(mineralSurface.enabled){
                     const auto firstHalf=cells[i];
@@ -824,7 +854,8 @@ int main(int argc,char** argv){
 #endif
         failCollectively(errors,"KINETICS");
         mineralSurface.recordReactions(before,cells,dt);
-        forAll(eps,i){const auto& s=cells[i];double mass=saltchem::aqueousMass(s);totalSource[i]=0;for(int j=0;j<7;j++){const double extent=before[i].mineral[j]-s.mineral[j];solid[j][i]=s.mineral[j]*model.molarVolume[j];totalSource[i]+=saltchem::mineralMass[j]*extent/dt;source[j][i]=saltchem::componentMass[j]*(s.aqueous[j]-before[i].aqueous[j])/dt;Y[j][i]=saltchem::componentMass[j]*s.aqueous[j]/mass;if(extent>=0)dissolved[j]+=extent*mesh.V()[i];else precipitated[j]-=extent*mesh.V()[i];}if(mineralSurface.fluidSide()){totalSource[i]=(s.waterEquivalent-before[i].waterEquivalent)/dt;for(int j=0;j<7;j++)totalSource[i]+=source[j][i];}eps[i]=saltchem::poreFraction(s,rates[i].geometry,model.molarVolume);}
+        if(dualSurface.enabled)forAll(eps,i)rates[i].geometry.inertFraction=dualSurface.closedFraction(i);
+        forAll(eps,i){const auto& s=cells[i];double mass=saltchem::aqueousMass(s);totalSource[i]=0;for(int j=0;j<7;j++){const double extent=before[i].mineral[j]-s.mineral[j];solid[j][i]=s.mineral[j]*model.molarVolume[j];totalSource[i]+=saltchem::mineralMass[j]*extent/dt;source[j][i]=saltchem::componentMass[j]*(s.aqueous[j]-before[i].aqueous[j])/dt;Y[j][i]=saltchem::componentMass[j]*s.aqueous[j]/mass;if(extent>=0)dissolved[j]+=extent*mesh.V()[i];else precipitated[j]-=extent*mesh.V()[i];}if(mineralSurface.fluidSide()||dualSurface.enabled){totalSource[i]=(s.waterEquivalent-before[i].waterEquivalent)/dt;for(int j=0;j<7;j++)totalSource[i]+=source[j][i];}eps[i]=saltchem::poreFraction(s,rates[i].geometry,model.molarVolume);}
         // Accumulated dissolution/precipitation below is resolved per global
         // step. Local sign reversals within a step are not counted twice.
         for(int j=0;j<7;j++){solid[j].correctBoundaryConditions();Y[j].correctBoundaryConditions();}eps.correctBoundaryConditions();mineralSurface.updateTransport(eps);updateProperties(true);updateHydraulics();chemistryTime+=elapsed(tick);
@@ -851,7 +882,7 @@ int main(int argc,char** argv){
                 if(adaptiveFlowCorrectors&&flowChange<flowTol&&massResidual<massTolerance)break;
             }
             flowChange=max(flowChange,gMax(mag(U.primitiveField()-previousOuterVelocity))/max(gMax(mag(U.primitiveField())),1e-12));
-            updateReservoirs();tick=Timer::now();scalarField previousRho(rho.primitiveField());std::array<scalarField,7> previousY;for(int j=0;j<7;j++)previousY[j]=Y[j].primitiveField();volScalarField cap(eps*rho);surfaceScalarField deff(mineralSurface.diffusivity(D,eps,rho));couplingChange=0;
+            updateReservoirs();tick=Timer::now();scalarField previousRho(rho.primitiveField());std::array<scalarField,7> previousY;for(int j=0;j<7;j++)previousY[j]=Y[j].primitiveField();volScalarField cap(eps*rho);surfaceScalarField deff(effectiveDiffusivity());couplingChange=0;
             saltflow::transport(Y,active,cap,deff,massPhi,oldMass,oldY,source,dt,reuseTransport,positivityTolerance,positivityMass,transportAssemblies);
             std::array<scalarField,7> defect;double dot=0,norm=0;
             for(int j=0;j<7;j++){
@@ -912,7 +943,7 @@ int main(int argc,char** argv){
                 }
                 if(couplingChange>=couplingTol||massResidual>=massTolerance)continue;
                 tick=Timer::now();
-                volScalarField finalCapacity(eps*rho);surfaceScalarField finalDiffusivity(mineralSurface.diffusivity(D,eps,rho));
+                volScalarField finalCapacity(eps*rho);surfaceScalarField finalDiffusivity(effectiveDiffusivity());
                 equationResidual=saltflow::residual(Y,active,finalCapacity,finalDiffusivity,massPhi,oldMass,oldY,source,dt);transportTime+=elapsed(tick);
                 if(iteration%25==0)Info<<"TRANSPORT_RESIDUAL "<<runTime.value()<<" iteration="<<iteration<<" value="<<equationResidual<<endl;
                 if(equationResidual<couplingTol&&checkMomentum(true)<flowTol)break;
@@ -974,7 +1005,7 @@ int main(int argc,char** argv){
         // We already clip to exact write events, so suppress early rounding
         // and force writing at the actual boundary instead.
         const bool writeDue=physicalWrite?runTime.value()+writeTolerance>=nextNativeWrite:runTime.writeTime();
-        auto writeStart=Timer::now();if(writeDue){chemicalPressure.correctBoundaryConditions();runTime.writeNow();mineralSurface.checkpoint(true);checkpoint();}outputTime+=elapsed(writeStart);
+        auto writeStart=Timer::now();if(writeDue){chemicalPressure.correctBoundaryConditions();runTime.writeNow();mineralSurface.checkpoint(true);dualSurface.checkpoint();checkpoint();}outputTime+=elapsed(writeStart);
     }
     // Compact per-cell profiling survives export and can drive a weighted
     // decomposition for a subsequent run. Counts include rejected trial work.
@@ -983,7 +1014,7 @@ int main(int argc,char** argv){
         std::ofstream f((out/"chemistry_cells.csv").c_str());f<<std::setprecision(16)<<"global_cell,x_m,y_m,z_m,wall_s,rate_evaluations,rejected_substeps,fallbacks\n";
         forAll(eps,i)f<<globalCells[i]<<','<<centres[i].x()<<','<<centres[i].y()<<','<<centres[i].z()<<','<<cellSeconds[i]<<','<<cellEvaluations[i]<<','<<cellRejected[i]<<','<<cellFallbacks[i]<<'\n';}
     volScalarField chemistryWork(IOobject("chemistryWork",runTime.timeName(),mesh,IOobject::NO_READ,IOobject::AUTO_WRITE),mesh,dimensionedScalar(dimless,1));
-    forAll(eps,i)chemistryWork[i]=1+cellEvaluations[i]/max(trialSegments,1.);chemistryWork.correctBoundaryConditions();runTime.writeNow();mineralSurface.checkpoint(true);checkpoint();
+    forAll(eps,i)chemistryWork[i]=1+cellEvaluations[i]/max(trialSegments,1.);chemistryWork.correctBoundaryConditions();runTime.writeNow();mineralSurface.checkpoint(true);dualSurface.checkpoint();checkpoint();
     double rankWork=std::accumulate(cellSeconds.begin(),cellSeconds.end(),0.),maximumRankWork=rankWork,totalRankWork=rankWork;
     reduce(maximumRankWork,maxOp<double>());reduce(totalRankWork,sumOp<double>());reduce(skippedChemistry,sumOp<double>());reduce(eosLinearized,sumOp<double>());reduce(boundaryPropertyEvaluations,sumOp<double>());reduce(boundaryPropertyHits,sumOp<double>());
     const double chemistryImbalance=totalRankWork>0?maximumRankWork*Pstream::nProcs()/totalRankWork:1.;
@@ -1015,6 +1046,18 @@ int main(int argc,char** argv){
         f<<"minimum_coupling_relaxation,"<<minimumCouplingRelaxation<<"\nminimum_used_coupling_relaxation,"<<minimumUsedCouplingRelaxation<<'\n';
         f<<"accelerate_face_flux,"<<accelerateFaceFlux<<'\n';
         f<<"heterogeneous_interface_model,"<<mineralSurface.enabled<<"\ninterface_geometry_s_inclusive,"<<interfaceGeometryTime<<'\n';
+        f<<"dual_geometry_model,"<<dualSurface.enabled<<"\ndual_geometry_s,"<<dualSurface.geometrySeconds<<"\ndual_chemistry_calls,"<<dualSurface.calls
+         <<"\ndual_accepted_substeps,"<<dualSurface.accepted<<"\ndual_geometry_retries,"<<dualSurface.retries<<"\ndual_max_volume_fraction_error,"<<dualSurface.maxVolumeError
+         <<"\ndual_max_local_liquid_regions,"<<dualSurface.maxLocalLiquidRegions
+         <<"\ndual_max_isolated_liquid_fraction,"<<dualSurface.maxIsolatedLiquidFraction
+         <<"\ndual_geometry_boolean_fallbacks,"<<dualSurface.geometry.booleanFallbacks
+         <<"\ndual_maximum_shared_reactors,"<<dualSurface.maximumReactors<<"\ndual_min_receiver_liquid_fraction,"<<dualSurface.minimumReceiverPore
+         <<"\ndual_nuclei_Halite,"<<dualSurface.nuclei(0)<<"\ndual_nuclei_Sylvite,"<<dualSurface.nuclei(1)<<"\ndual_nuclei_Carnallite,"<<dualSurface.nuclei(2)
+         <<"\ndual_local_reaction_exchange_s,"<<dualSurface.waterExchangeSeconds<<"\ndual_water_remap_s,"<<dualSurface.waterRemapSeconds
+         <<"\ndual_max_water_pools,"<<dualSurface.maxWaterPools<<"\ndual_max_coupled_water_regions,"<<dualSurface.maxWaterCluster
+         <<"\ndual_water_exchange_residual,"<<dualSurface.maxWaterResidual<<"\ndual_local_reaction_residual_ratio,"<<dualSurface.maxLocalReactionResidual
+         <<"\ndual_local_reaction_state_error_ratio,"<<dualSurface.maxLocalStateError
+         <<"\ndual_contact_events,"<<dualSurface.contactEvents<<'\n';
         f<<"solid_owned_sharp_surface_peak_cells,"<<mineralSurface.sharpSurfaceCells()
          <<"\nsolid_owned_sharp_surface_peak_area_m2,"<<mineralSurface.sharpSurfaceArea()<<'\n';
         f<<"cache_boundary_properties,"<<cacheBoundaryProperties<<"\nboundary_property_evaluations,"<<boundaryPropertyEvaluations<<"\nboundary_property_cache_hits,"<<boundaryPropertyHits<<'\n';

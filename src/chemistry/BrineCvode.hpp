@@ -101,11 +101,16 @@ inline IntegrationStats Reactions::advanceCvode(Inventory& state,double interval
     double time=0;int calls=0;MineralVector previous{};
     auto restart=[&](){
         w.base=state;w.segmentParameters.geometry.initialPorosity=porosity;previous.fill(0);N_VConst(0,w.y);
-        // An absent solid allows precipitation (negative extent), but cannot
-        // dissolve into a negative stock. A passive zero variable supplies a
-        // harmless constraint when all seven physical phases are present;
-        // CVODE does not accept an all-zero constraint vector.
-        for(int j=0;j<nMinerals;j++)NV_Ith_S(w.constraints,j)=state.mineral[j]==0?-1:0;
+        // Separate surface operators can permit only one reaction direction.
+        // Enforce that sign on the integrated extent as well as on the RHS:
+        // a dense BDF solve can otherwise create a tiny opposite-direction
+        // extent in a saturated phase coupled to another dissolving mineral.
+        // The passive zero variable keeps the constraint vector nonempty.
+        for(int j=0;j<nMinerals;j++){
+            const bool separate=p.geometry.separateMineralAreas;
+            NV_Ith_S(w.constraints,j)=separate&&p.geometry.growthArea[j]==0?1:
+                (state.mineral[j]==0||(separate&&p.area[j]==0)?-1:0);
+        }
         NV_Ith_S(w.constraints,nMinerals)=1;
         Workspace::checked(CVodeReInit(w.memory,time,w.y));Workspace::checked(CVodeSetConstraints(w.memory,w.constraints));
         Workspace::checked(CVodeSetStopTime(w.memory,interval));Workspace::checked(CVodeSetMaxNumSteps(w.memory,options.maximumAttempts));

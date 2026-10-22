@@ -19,11 +19,15 @@ int main(int argc,char** argv){
     labelList ranks(nx*ny,-1),indices(nx*ny,-1),ids(mesh.nCells());
     forAll(mesh.C(),i){const label gx=std::llround(mesh.C()[i].x()/spacing-.5),gy=std::llround(mesh.C()[i].y()/spacing-.5);ids[i]=gx+nx*gy;ranks[ids[i]]=Pstream::myProcNo();indices[ids[i]]=i;}
     for(label id=0;id<nx*ny;id++){reduce(ranks[id],maxOp<label>());reduce(indices[id],maxOp<label>());}
-    const std::array<std::array<label,2>,12> displacements{{{{1,0}},{{-1,0}},{{0,1}},{{0,-1}},{{2,0}},{{-2,0}},{{0,2}},{{0,-2}},{{1,1}},{{1,-1}},{{-1,1}},{{-1,-1}}}};
+    const label maximumDistance=config.lookupOrDefault<label>("maximumDistance",2);
+    if(maximumDistance<2||maximumDistance>4)return 14;
+    std::vector<std::array<label,2>> displacements;
+    for(label x=-maximumDistance;x<=maximumDistance;x++)for(label y=-maximumDistance;y<=maximumDistance;y++)
+        if(std::abs(x)+std::abs(y)>=1&&std::abs(x)+std::abs(y)<=maximumDistance)displacements.push_back({{x,y}});
     std::vector<SurfaceLink> links;
     forAll(ids,i){std::set<label> targets;for(const auto& d:displacements){
         const label gx=ids[i]%nx,gy=ids[i]/nx;label rx=gx+d[0],ry=gy+d[1];
-        if(periodic[0])rx=(rx+nx)%nx;if(periodic[1])ry=(ry+ny)%ny;
+        if(periodic[0])rx=(rx%nx+nx)%nx;if(periodic[1])ry=(ry%ny+ny)%ny;
         if(rx>=0&&rx<nx&&ry>=0&&ry<ny){const label target=rx+nx*ry;if(target!=ids[i]&&targets.insert(target).second)links.push_back({i,ranks[target],indices[target],gx,gy,rx,ry});}
     }
     }
@@ -39,7 +43,7 @@ int main(int argc,char** argv){
     for(auto& area:areas)for(unsigned j=0;j<7;j++)area[j]=j+1;
     exchange.scatterAddTargets(areas,cellAreas);
     forAll(ids,i){
-        label expected=0;for(label x=0;x<nx;x++)for(label y=0;y<ny;y++){const label d=distance(x,y,ids[i]%nx,ids[i]/nx);expected+=d>=1&&d<=2;}
+        label expected=0;for(label x=0;x<nx;x++)for(label y=0;y<ny;y++){const label d=distance(x,y,ids[i]%nx,ids[i]/nx);expected+=d>=1&&d<=maximumDistance;}
         for(unsigned j=0;j<7;j++)if(cellAreas[i][j]!=expected*(j+1))return 3;
     }
     auto contribution=[](label id){return id%3==0?1e16:id%3==1?.1*(id+1):1e-9*(id+1);};
@@ -55,7 +59,7 @@ int main(int argc,char** argv){
     forAll(ids,i){
         FixedList<scalar,7> expected(Zero);const label rx=ids[i]%nx,ry=ids[i]/nx;
         for(label gx=0;gx<nx;gx++)for(label gy=0;gy<ny;gy++){
-            const label d=distance(gx,gy,rx,ry);if(d<1||d>2)continue;
+            const label d=distance(gx,gy,rx,ry);if(d<1||d>maximumDistance)continue;
             const auto moment=moments(gx,gy,rx,ry);for(unsigned j=0;j<7;j++)expected[j]+=moment[j];
         }
         if(cellAreas[i]!=expected)return 12;

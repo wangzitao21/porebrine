@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import shutil
 
 import numpy as np
 
@@ -123,6 +124,13 @@ def generate(input_directory, work, ranks=None):
     text = head('reactiveProperties')+f'database "{ROOT}/src/chemistry/pitzer.dat";\n'
     text += f'diffusivity [0 2 -1 0 0 0 0] {literal(p["diffusivity_m2_s"])};\n'
     text += '\n'.join(f'{name} {literal(value)};' for name, value in controls.items())+'\n'
+    if 'initial_coating' in r:
+        coat = r['initial_coating']
+        values = {'substrate': coat['substrate'], 'morphology': coat['morphology'],
+                  'volumeM3': coat['volume_m3'], 'particleRadius': coat['particle_radius_m'],
+                  'contactAngle': coat['contact_angle_deg'],
+                  'volumeShares': [coat['volume_shares'][name] for name in MINERALS]}
+        text += 'initialSurfaceCoating {'+' '.join(f'{name} {literal(value)};' for name, value in values.items())+'}\n'
     text += 'hydraulicBoundaries {\n'
     for port, incoming in zip(config['boundaries'], reservoir):
         unit = {'pressure': 'value_Pa', 'head': 'value_m', 'flowRate': 'value_m3_s'}[port['type']]
@@ -145,4 +153,6 @@ def generate(input_directory, work, ranks=None):
     text += '}\n'
     put('constant/reactiveProperties', text)
     put('system/decomposeParDict', head('decomposeParDict')+f'numberOfSubdomains {ranks or solver["mpi_ranks"]};method scotch;\n')
+    if config.get('advanced', {}).get('dualMineralGeometry', False):
+        shutil.copy2(Path(input_directory)/'dual_geometry.bin', work/'constant/dualGeometry.bin')
     return config

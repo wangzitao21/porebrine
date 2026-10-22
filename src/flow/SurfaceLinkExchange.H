@@ -22,7 +22,7 @@ struct SurfaceLink {
 class SurfaceLinkExchange {
     using Label=Foam::label;
     using Request=Foam::FixedList<Label,6>;
-    static constexpr int colourCount=36;
+    static constexpr int colourCount=120;
     struct Partner {
         Label rank;
         Label incomingOffset=0;
@@ -50,14 +50,19 @@ class SurfaceLinkExchange {
         if(invalid)throw std::invalid_argument(message);
     }
     int colourOf(Label gx,Label gy,Label rx,Label ry)const {
-        static constexpr std::array<std::array<int,2>,12> displacement{{
+        static constexpr std::array<std::array<int,2>,40> displacement{{
             {{1,0}},{{-1,0}},{{0,1}},{{0,-1}},{{2,0}},{{-2,0}},
-            {{0,2}},{{0,-2}},{{1,1}},{{1,-1}},{{-1,1}},{{-1,-1}}
+            {{0,2}},{{0,-2}},{{1,1}},{{1,-1}},{{-1,1}},{{-1,-1}},
+            {{3,0}},{{-3,0}},{{0,3}},{{0,-3}},
+            {{2,1}},{{2,-1}},{{-2,1}},{{-2,-1}},{{1,2}},{{1,-2}},{{-1,2}},{{-1,-2}},
+            {{4,0}},{{-4,0}},{{0,4}},{{0,-4}},
+            {{3,1}},{{3,-1}},{{-3,1}},{{-3,-1}},{{1,3}},{{1,-3}},{{-1,3}},{{-1,-3}},
+            {{2,2}},{{2,-2}},{{-2,2}},{{-2,-2}}
         }};
         const std::array<Label,2> raw{{rx-gx,ry-gy}};auto canonical=raw;
         for(int axis=0;axis<2;axis++)if(periodic_[axis]&&std::abs(canonical[axis])>extent_[axis]/2)
             canonical[axis]+=canonical[axis]>0?-extent_[axis]:extent_[axis];
-        for(int direction=0;direction<12;direction++){
+        for(int direction=0;direction<int(displacement.size());direction++){
             const auto& d=displacement[direction];
             if(canonical[0]==d[0]&&canonical[1]==d[1]){
                 const int axis=d[0]?0:1;
@@ -138,7 +143,7 @@ public:
                 else invalid|=coordinates[link.receiverCell][0]!=link.rx||coordinates[link.receiverCell][1]!=link.ry;
             }else{sendCounts[link.receiverRank]++;remoteSlot_[i]=remoteCount_++;}
         }
-        requireCollectively(invalid,"Surface links require valid local sources and in-domain Cartesian receivers one or two grid steps away under the configured periodic axes");
+        requireCollectively(invalid,"Surface links require valid local sources and in-domain Cartesian receivers one to four grid steps away under the configured periodic axes");
         UPstream::allToAll(sendCounts,receiveCounts);
         labelList partnerIndex(Pstream::nProcs(),-1);
         for(Label rank=0;rank<Pstream::nProcs();rank++)if(sendCounts[rank]||receiveCounts[rank]){

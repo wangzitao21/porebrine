@@ -7,10 +7,11 @@ import re
 import numpy as np
 
 from . import ROOT
+from .dual_geometry import read_geometry_header
 
 COMPONENTS = ('Na', 'K', 'Ca', 'Mg', 'Cl', 'S', 'C')
 MINERALS = ('Halite', 'Sylvite', 'Carnallite', 'Polyhalite', 'Gypsum', 'Bischofite', 'Calcite')
-INPUT_FILES = ('config.json', 'geometry.npz', 'initial_conditions.npz')
+INPUT_FILES = ('config.json', 'geometry.npz', 'initial_conditions.npz', 'dual_geometry.bin')
 
 
 def default_config(nx=16, ny=8, spacing=1e-5):
@@ -118,6 +119,14 @@ ADVANCED = {
     'transportRoundoffTolerance': (float, 0), 'densityPressureTolerance': (float, 0),
     'minimumCouplingRelaxation': (float, 0), 'maximumCouplingRelaxation': (float, 0),
     'initializePressure': (bool, None), 'solidOwnerSurfacePolicy': (('fluidSide', 'reject', 'volumeAveraged'), None),
+    'nucleusResolutionModel': (('plic', 'population'), None),
+    'interfaceNormalModel': (('central', 'heightFit'), None),
+    'surfaceRoutingHops': (int, 1),
+    'liquidControlVolumeFraction': (float, 0),
+    'isolatedLiquidControlVolumes': (bool, None),
+    'dualMineralGeometry': (bool, None), 'dualIgnoreShielding': (bool, None),
+    'dualGeometryInterval': (float, 0), 'dualMinimumLiquidFraction': (float, 0),
+    'dualWaterNeckFraction': (float, 0),
     'timeRelativeTolerance': (float, 0), 'timePorosityTolerance': (float, 0),
     'timeInventoryTolerance': (float, 0), 'timeWaterTolerance': (float, 0),
     'timeVelocityTolerance': (float, 0), 'timeSurfaceTolerance': (float, 0),
@@ -194,7 +203,7 @@ def validate_config(config):
     if not pressure_reference:
         fail('At least one pressure/head boundary is required to fix the pressure datum')
     r = config['reactions']
-    keys(r, base['reactions'], 'reactions', base['reactions'])
+    keys(r, set(base['reactions'])|{'initial_coating'}, 'reactions', base['reactions'])
     composition(r['rate_coefficients_mol_m2_s'], MINERALS, 'rate_coefficients_mol_m2_s')
     choice(r['interface_model'], ('phaseVector', 'heterogeneous'), 'interface_model')
     boolean(r['surface_blocking'], 'surface_blocking')
@@ -225,8 +234,22 @@ def validate_config(config):
         for name in ('effective_barrier', 'interfacial_energy_J_m2'):
             if name in law:
                 number(law[name], name, minimum=0, positive=name == 'interfacial_energy_J_m2')
-    if r['interface_model'] == 'phaseVector' and (r['nucleation'] or layer['model'] != 'impermeable'):
+    if r['interface_model'] == 'phaseVector' and ((r['nucleation'] and not config.get('advanced', {}).get('dualMineralGeometry', False)) or layer['model'] != 'impermeable'):
         fail('Nucleation and product layers require the heterogeneous interface model')
+    if 'initial_coating' in r:
+        coat = r['initial_coating']
+        required = ('substrate', 'morphology', 'volume_m3', 'volume_shares', 'particle_radius_m', 'contact_angle_deg')
+        keys(coat, required, 'initial_coating', required)
+        choice(coat['substrate'], MINERALS, 'initial_coating.substrate')
+        choice(coat['morphology'], ('particles', 'film'), 'initial_coating.morphology')
+        composition(coat['volume_shares'], MINERALS, 'initial_coating.volume_shares')
+        if abs(sum(coat['volume_shares'].values())-1) > 1e-12 or coat['volume_shares'][coat['substrate']] != 0:
+            fail('Initial coating volume shares must sum to one and exclude the substrate')
+        for name in ('volume_m3', 'particle_radius_m'):
+            number(coat[name], 'initial_coating.'+name, positive=True)
+        number(coat['contact_angle_deg'], 'initial_coating.contact_angle_deg', positive=True, maximum=180-1e-10)
+        if r['interface_model'] != 'heterogeneous' or config.get('advanced', {}).get('nucleusResolutionModel') != 'population':
+            fail('Initial coating requires heterogeneous interfaces and population representation')
     sim = config['simulation']
     keys(sim, set(base['simulation'])|{'minimum_time_step_s', 'maximum_time_step_s'}, 'simulation', base['simulation'])
     for name in ('end_time_s', 'time_step_s'):
@@ -270,6 +293,22 @@ def validate_config(config):
         fail('maxCouplingIterations cannot exceed maxFlowIterations')
     if advanced.get('anchorTransitionWidth', .01) > 2*advanced.get('anchorThreshold', .01):
         fail('anchorTransitionWidth exceeds twice anchorThreshold')
+    if advanced.get('surfaceRoutingHops', 2) > 4:
+        fail('surfaceRoutingHops cannot exceed four Cartesian links')
+    if advanced.get('liquidControlVolumeFraction', 0) > 1:
+        fail('liquidControlVolumeFraction cannot exceed one')
+    if advanced.get('dualMineralGeometry', False):
+        if r['interface_model'] != 'phaseVector' or s['mpi_ranks'] != 1 or sim['adaptive_time_step']:
+            fail('dualMineralGeometry requires phaseVector, one MPI rank and no step-doubling controller')
+        if advanced.get('dualGeometryInterval', .01) <= 0:
+            fail('dualGeometryInterval must be positive')
+        if not 0 < advanced.get('dualMinimumLiquidFraction', .5) <= 1:
+            fail('dualMinimumLiquidFraction must lie in (0,1]')
+        if not 0 <= advanced.get('dualWaterNeckFraction', .1) <= 1:
+            fail('dualWaterNeckFraction must lie in [0,1]')
+        for law in r['nucleation']:
+            if law['product'] not in MINERALS[:3] or law['substrate'] not in MINERALS[:3] or 'effective_barrier' not in law:
+                fail('dualMineralGeometry supports effective-barrier nucleation of the first three minerals')
     return config
 
 
@@ -299,6 +338,15 @@ def read_inputs(directory):
             fail(f'Missing or linked input: {name}')
     config = validate_config(read_json(directory/'config.json'))
     m = config['mesh']
+    dual = directory/'dual_geometry.bin'
+    if config.get('advanced', {}).get('dualMineralGeometry', False):
+        if not dual.is_file() or dual.is_symlink():
+            fail('Dual mineral geometry requires input_data/dual_geometry.bin')
+        header = read_geometry_header(dual)
+        if (header.nx, header.ny) != (m['nx'], m['ny']) or not math.isclose(header.spacing, m['spacing_m'], rel_tol=1e-12) or not math.isclose(header.depth, m['thickness_m'], rel_tol=1e-12) or header.epsilon != config['physics']['minimum_porosity']:
+            fail('Fine geometry must match the main mesh and minimum porosity')
+    elif dual.exists():
+        fail('Enable dualMineralGeometry when supplying dual_geometry.bin')
     shape = (m['ny'], m['nx'])
     with np.load(directory/'geometry.npz', allow_pickle=False) as geometry:
         if set(geometry.files) != {'solid_fractions'}:

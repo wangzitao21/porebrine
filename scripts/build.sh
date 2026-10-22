@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-set +eu
-source "$(dirname "$0")/environment.sh"
 set -euo pipefail
-cd "$SALT_PROJECT"
-reference=0;checks=0;flow_only=0;tests_only=0;native_cpu=0
+reference=0;checks=0;flow_only=0;tests_only=0;native_cpu=0;benchmarks=0;tools=0
 for arg in "$@"; do
  case "$arg" in
   --reference) reference=1;;
@@ -11,17 +8,33 @@ for arg in "$@"; do
   --tests-only) tests_only=1;checks=1;;
   --flow-only) flow_only=1;;
   --native) native_cpu=1;;
-  --help) echo 'Usage: bash scripts/build.sh [--reference] [--checks | --tests-only | --flow-only] [--native]'; exit 0;;
+  --benchmarks) benchmarks=1;;
+  --tools) tools=1;;
+  --help)
+   printf '%s\n' 'Usage: bash scripts/build.sh [--reference] [--checks | --tests-only | --flow-only] [--native] [--benchmarks] [--tools]' \
+    'Environment: OPENFOAM_BASHRC, SUNDIALS_PREFIX, optional RM_PREFIX and GEOS_PREFIX.' \
+    'Python tools: python3 -m pip install -r scripts/requirements.txt' \
+    '--checks builds regression tests; --benchmarks and --tools build optional programs.'
+   exit 0;;
   *) echo "Unknown build option: $arg" >&2; exit 2;;
  esac
 done
 if (( flow_only && checks )); then echo '--flow-only cannot be combined with --checks or --tests-only' >&2; exit 2; fi
+set +eu
+source "$(dirname "$0")/environment.sh" || exit 1
+set -euo pipefail
+cd "$SALT_PROJECT"
 [[ -f "$SUNDIALS_PREFIX/include/cvode/cvode.h" ]] || { echo 'Set SUNDIALS_PREFIX to a SUNDIALS installation with CVODE.' >&2; exit 1; }
+geometry_prefix=${GEOS_PREFIX:-"$SALT_PROJECT/bin/geos"}
+if [[ ! -f "$geometry_prefix/include/geos_c.h" ]]; then geometry_prefix=/usr; fi
+[[ -f "$geometry_prefix/include/geos_c.h" ]] || { echo 'Dual geometry requires GEOS >= 3.11; run bash scripts/build_geometry.sh.' >&2; exit 1; }
 mkdir -p bin
 stage=$(mktemp -d "$SALT_PROJECT/bin/.build.XXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 common=(-std=c++17 -O3 -g -fopenmp -Wall -Wextra -Wno-misleading-indentation
- -Isrc/chemistry -Isrc/geometry -Isrc/flow -Isrc/reference)
+ -Isrc/chemistry -Isrc/geometry -Isrc/flow -Isrc/reference -I"$geometry_prefix/include")
+geometry_libs=(-lgeos_c)
+if [[ "$geometry_prefix" != /usr ]]; then geometry_libs=(-L"$geometry_prefix/lib" -Wl,-rpath,"$geometry_prefix/lib" -lgeos_c); fi
 if (( native_cpu )); then common+=(-march=native -mtune=native); fi
 chemistry=(-DSALT_HAS_CVODE -I"$SUNDIALS_PREFIX/include")
 kinetic_libs=(-L"$SUNDIALS_PREFIX/lib" -Wl,--exclude-libs,ALL -lsundials_cvode
@@ -31,11 +44,12 @@ foam=(-DWM_DP -DWM_LABEL_SIZE=32 -DNoRepository -I"$FOAM_SRC/OpenFOAM/lnInclude"
 foam_libs=(-L"$FOAM_LIBBIN" -L"$FOAM_LIBBIN/$FOAM_MPI" -Wl,-rpath,"$FOAM_LIBBIN"
  -Wl,-rpath,"$FOAM_LIBBIN/$FOAM_MPI" -lfiniteVolume -lmeshTools -lOpenFOAM -lPstream)
 if (( ! flow_only && ! tests_only )); then
+ g++ "${common[@]}" src/apps/makeDualGeometry.cpp "${geometry_libs[@]}" -o "$stage/makeDualGeometry"
  g++ "${common[@]}" "${chemistry[@]}" -fPIC -shared src/chemistry/SaltChemistryC.cpp "${kinetic_libs[@]}" -o "$stage/libSaltChemistry.so"
  g++ "${common[@]}" src/apps/saltChemistry.cpp -L"$stage" -Wl,-rpath,'$ORIGIN' -lSaltChemistry -o "$stage/saltChemistry"
 fi
 if (( ! tests_only )); then
- g++ "${common[@]}" "${chemistry[@]}" "${foam[@]}" src/flow/saltLakeFoam.C "${foam_libs[@]}" "${kinetic_libs[@]}" -o "$stage/saltLakeFoam"
+ g++ "${common[@]}" "${chemistry[@]}" "${foam[@]}" src/flow/saltLakeFoam.C "${foam_libs[@]}" "${kinetic_libs[@]}" "${geometry_libs[@]}" -o "$stage/saltLakeFoam"
 fi
 if (( ! flow_only && ! tests_only )); then
  g++ "${common[@]}" "${foam[@]}" -fPIC -shared src/flow/FoamSaltChemistry.C -L"$stage" -Wl,-rpath,'$ORIGIN' -lSaltChemistry "${foam_libs[@]}" -o "$stage/libFoamSaltChemistry.so"
@@ -49,8 +63,9 @@ if (( checks )); then
   done
  fi
  mkdir -p "$stage/tests"
- for name in verifyContracts verifyDerivatives verifyMineralInterface verifyProductTransport verifySurfaceReaction verifyNucleation verifyCapReactions verifySurfaceFilm verifySurfacePartition benchmarkSurfaceFilm; do
-  g++ "${common[@]}" "${chemistry[@]}" "src/tests/$name.cpp" "${kinetic_libs[@]}" -o "$stage/tests/$name"
+ native_tests=$(python3 -B scripts/check.py --list-core-tests)
+ for name in $native_tests; do
+  g++ "${common[@]}" "${chemistry[@]}" "src/tests/$name.cpp" "${kinetic_libs[@]}" "${geometry_libs[@]}" -o "$stage/tests/$name"
  done
  g++ "${common[@]}" src/tests/verifyChemistryApi.cpp -L"$test_library" -Wl,-rpath,'$ORIGIN/..' -lSaltChemistry -o "$stage/tests/verifyChemistryApi"
  g++ "${common[@]}" "${foam[@]}" src/tests/verifyFoamChemistry.C -L"$test_library" -Wl,-rpath,'$ORIGIN/..' -lFoamSaltChemistry -lSaltChemistry "${foam_libs[@]}" -o "$stage/tests/verifyFoamChemistry"
@@ -59,12 +74,28 @@ if (( checks )); then
  g++ "${common[@]}" "${foam[@]}" src/tests/verifySurfaceLinkExchange.C "${foam_libs[@]}" -o "$stage/tests/verifySurfaceLinkExchange"
  g++ "${common[@]}" "${foam[@]}" src/tests/verifySurfaceRouting.C "${foam_libs[@]}" -o "$stage/tests/verifySurfaceRouting"
 fi
+if (( benchmarks || tools )); then
+ for kind in benchmarks tools; do
+  if [[ "$kind" == benchmarks ]]; then
+   (( benchmarks )) || continue
+   sources=(src/benchmarks/*.cpp)
+  else
+   (( tools )) || continue
+   sources=(src/apps/replayDual*.cpp)
+  fi
+  mkdir -p "$stage/$kind"
+  for source in "${sources[@]}"; do
+   name=$(basename "$source" .cpp)
+   g++ "${common[@]}" "${chemistry[@]}" "$source" "${kinetic_libs[@]}" "${geometry_libs[@]}" -o "$stage/$kind/$name"
+  done
+ done
+fi
 if (( reference )); then
  [[ -f "$RM_PREFIX/include/PhreeqcRM.h" ]] || { echo 'Set RM_PREFIX to a PhreeqcRM installation.' >&2; exit 1; }
  mkdir -p "$stage/reference"
  rm_libs=(-L"$RM_PREFIX/lib" -Wl,-rpath,"$RM_PREFIX/lib" -lPhreeqcRM)
  if (( ! tests_only )); then
-  g++ "${common[@]}" "${chemistry[@]}" "${foam[@]}" -I"$RM_PREFIX/include" -DSALT_REFERENCE_BACKEND src/flow/saltLakeFoam.C "${foam_libs[@]}" "${kinetic_libs[@]}" "${rm_libs[@]}" -o "$stage/reference/saltLakePhreeqcFoam"
+  g++ "${common[@]}" "${chemistry[@]}" "${foam[@]}" -I"$RM_PREFIX/include" -DSALT_REFERENCE_BACKEND src/flow/saltLakeFoam.C "${foam_libs[@]}" "${kinetic_libs[@]}" "${rm_libs[@]}" "${geometry_libs[@]}" -o "$stage/reference/saltLakePhreeqcFoam"
  fi
  if (( ! flow_only )); then
   g++ "${common[@]}" "${chemistry[@]}" -I"$RM_PREFIX/include" src/tests/verifyTemperaturePressure.cpp "${kinetic_libs[@]}" "${rm_libs[@]}" -o "$stage/reference/verifyTemperaturePressure"

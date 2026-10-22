@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "MineralInterface.hpp"
+#include "SurfaceStateIO.hpp"
 #include "SurfaceReaction.hpp"
 #include "CapReactions.hpp"
 #include "PhaseTransform.H"
@@ -21,6 +22,12 @@ class MineralSurface {
     const Foam::fvMesh& mesh;const PhaseStencil& stencil;
     double dx,dy,epsilonMin,resolvedRadius,surfaceTimeTolerance,molecularDiffusivity;
     bool blocking;std::uint64_t seed;
+    bool resolveNuclei=true;
+    bool fitInterfaceNormal=false;
+    bool isolatedLiquidControlVolumes=false;
+    static constexpr int maximumRouteHops=4;
+    int routeHops=2;
+    double liquidControlVolumeFraction=0;
     saltgeom::ProductLayer productLayer;
     std::vector<saltgeom::NucleationLaw> laws;
     std::vector<std::uint64_t> keys;
@@ -41,7 +48,7 @@ class MineralSurface {
     struct ReactionPatch {
         saltchem::MineralVector area{};
         std::array<saltgeom::Point,7> normal{};
-        std::array<RouteEdge,2> route{};
+        std::array<RouteEdge,maximumRouteHops> route{};
         int hops=0;
         double waterResistance=0; // Unit-patch-area resistance, before division by D.
     };
@@ -82,6 +89,20 @@ public:
         if(solidOwnerSurfacePolicy!="fluidSide"&&solidOwnerSurfacePolicy!="volumeAveraged"&&solidOwnerSurfacePolicy!="reject")
             throw std::invalid_argument("solidOwnerSurfacePolicy must be fluidSide, volumeAveraged or reject");
         if(!enabled)return;
+        const auto resolutionModel=cfg.lookupOrDefault<Foam::word>("nucleusResolutionModel","plic");
+        if(resolutionModel!="plic"&&resolutionModel!="population")
+            throw std::invalid_argument("nucleusResolutionModel must be plic or population");
+        resolveNuclei=resolutionModel=="plic";
+        const auto normalModel=cfg.lookupOrDefault<Foam::word>("interfaceNormalModel","central");
+        if(normalModel!="central"&&normalModel!="heightFit")throw std::invalid_argument("interfaceNormalModel must be central or heightFit");
+        fitInterfaceNormal=normalModel=="heightFit";
+        routeHops=cfg.lookupOrDefault<Foam::label>("surfaceRoutingHops",2);
+        if(routeHops<1||routeHops>maximumRouteHops)
+            throw std::invalid_argument("surfaceRoutingHops must lie between 1 and 4");
+        liquidControlVolumeFraction=cfg.lookupOrDefault<Foam::scalar>("liquidControlVolumeFraction",0);
+        isolatedLiquidControlVolumes=cfg.lookupOrDefault<bool>("isolatedLiquidControlVolumes",false);
+        if(!std::isfinite(liquidControlVolumeFraction)||liquidControlVolumeFraction<0||liquidControlVolumeFraction>1)
+            throw std::invalid_argument("liquidControlVolumeFraction must lie between zero and one");
         const auto layerMode=cfg.lookupOrDefault<Foam::word>("productLayerModel","impermeable");
         if(layerMode!="impermeable"&&layerMode!="porous"&&layerMode!="crossGrid")throw std::invalid_argument("Unknown productLayerModel");
         productLayer.enabled=layerMode!="impermeable";productLayer.crossGrid=layerMode=="crossGrid";
@@ -142,6 +163,58 @@ public:
     Foam::label sharpSurfaceCells()const {return sharpSurfaceCells_;}
     double sharpSurfaceArea()const {return sharpSurfaceArea_;}
     bool fluidSide()const {return enabled&&solidOwnerSurfacePolicy=="fluidSide";}
+    // Controlled pre-coating experiment. This adds specified initial stock
+    // before the initial mass ledger is established; it is not a precipitation
+    // reaction and consumes no aqueous reagent. Same global volume on any grid.
+    void initializeCoating(const Foam::dictionary& cfg,Foam::PtrList<Foam::volScalarField>& solid,
+                           Foam::volScalarField& eps,const Foam::volScalarField& inert,
+                           const saltchem::RateParameters& kinetics){
+        if(mesh.time().value()!=0||!cfg.found("initialSurfaceCoating"))return;
+        if(!fluidSide()||resolveNuclei)throw std::invalid_argument("Initial coating requires fluidSide and population representation");
+        const auto& coating=cfg.subDict("initialSurfaceCoating");
+        const int substrate=saltchem::mineralIndex(Foam::word(coating.lookup("substrate")).c_str());
+        const auto morphology=Foam::word(coating.lookup("morphology"));
+        const double volume=Foam::readScalar(coating.lookup("volumeM3"));
+        const double r=Foam::readScalar(coating.lookup("particleRadius"));
+        const double angle=Foam::readScalar(coating.lookup("contactAngle"));
+        const Foam::List<Foam::scalar> shares(coating.lookup("volumeShares"));
+        if(substrate<0||substrate>=7||shares.size()!=7||(morphology!="particles"&&morphology!="film")||
+           !std::isfinite(volume)||volume<=0||!std::isfinite(r)||r<=0||!std::isfinite(angle)||angle<=0||angle>=180)
+            throw std::invalid_argument("Invalid initial surface-coating geometry");
+        double sum=0;for(double x:shares){if(!std::isfinite(x)||x<0)throw std::invalid_argument("Invalid coating mineral share");sum+=x;}
+        if(std::abs(sum-1)>1e-12||shares[substrate]!=0)throw std::invalid_argument("Coating shares must sum to one and exclude the substrate");
+        for(const auto& law:laws)if(law.substrate==substrate&&shares[law.product]>0)
+            throw std::invalid_argument("Controlled initial coatings require nucleation disabled for the seeded pairs");
+        reconstruct(solid,inert,kinetics);
+        double area=0;forAll(eps,i)area+=supportArea(i)[substrate];Foam::reduce(area,Foam::sumOp<double>());
+        if(!(area>0))throw std::invalid_argument("Initial coating has no liquid-accessible substrate");
+        int invalid=0;
+        forAll(eps,i){const double fraction=volume*supportArea(i)[substrate]/(area*mesh.V()[i]);
+            invalid|=fraction>0&&fraction/(1-(productLayer.enabled?productLayer.porosity:0))>
+                std::max(0.,eps[i]-epsilonMin)+64*std::numeric_limits<double>::epsilon();
+        }
+        Foam::reduce(invalid,Foam::maxOp<int>());
+        if(invalid)throw std::invalid_argument("Initial coating and its pore water do not fit the receiving liquid cells; refine the physical setup or liquid routing");
+        const double h=saltgeom::capHeightFactor(angle),particleVolume=saltgeom::capVolumeFactor(h)*r*r*r;
+        forAll(eps,i){const double support=supportArea(i)[substrate];if(!(support>0))continue;
+            for(int j=0;j<7;j++)if(shares[j]>0){
+                auto& pop=state[i].population[7*j+substrate];
+                if(pop.fraction>0)throw std::invalid_argument("Initial coating would overwrite an existing population");
+                pop.fraction=volume*support*shares[j]/(area*mesh.V()[i]);
+                // A continuous ensemble count removes mesh-indexed random
+                // sampling from the controlled morphology comparison.
+                pop.count=pop.fraction*mesh.V()[i]/particleVolume;
+                pop.heightFactor=h;pop.supportArea=pop.partitionSupport=support;
+                pop.birthNormal=reactionNormal[i][substrate];
+                pop.filmArea=morphology=="film"?support*shares[j]:0;
+                solid[j][i]+=pop.fraction;eps[i]-=pop.fraction;
+            }
+        }
+        for(auto& phase:solid)phase.correctBoundaryConditions();eps.correctBoundaryConditions();
+        reconstruct(solid,inert,kinetics);updateTransport(eps);
+        if(Foam::Pstream::master())Foam::Info<<"INITIAL_COATING volume_m3="<<volume<<" support_m2="<<area
+            <<" morphology="<<morphology<<" solid_equivalent_thickness_m="<<volume/area<<Foam::endl;
+    }
     SurfaceLinkExchange& surfaceExchange(){return *faceExchange;}
     const saltchem::MineralVector& supportArea(int i)const {return fluidSide()?support[i]:bare[i];}
     saltchem::MineralVector lockedCaps(int i,const saltchem::MineralVector& volume)const {
@@ -190,7 +263,7 @@ public:
             const double change=result.fractionChange[7*j+k];
             reactionVectors[i][0]-=change*normal.x;reactionVectors[i][1]-=change*normal.y;
         }
-        saltgeom::promoteResolvedPopulations(state[i],mesh.V()[i],resolvedRadius,reactionNormal[i]);
+        saltgeom::promoteResolvedPopulations(state[i],mesh.V()[i],resolvedRadius,reactionNormal[i],resolveNuclei);
     }
     void configureResolvedGrowth(int i,const saltchem::Inventory& cell,saltchem::RateParameters& r,std::size_t patch)const {
         r.geometry.separateMineralAreas=true;r.area.fill(0);
@@ -229,9 +302,9 @@ public:
         if(!crossGridTransport())return;
         int changedTransport=0;
         forAll(eps,i){
-            double retained=0,totalProduct=0,xx=0,yy=0,opticalVolume=0;
+            double retained=0,totalProduct=0,xx=0,yy=0,opticalVolume=0,filmProjection=0;
             for(int j=0;j<7;j++)for(int k=0;k<7;k++){
-                const auto& p=state[i].population[7*j+k];
+                const auto& p=state[i].population.get(7*j+k);
                 totalProduct+=p.fraction;
                 const double residue=1-saltgeom::attachedShare(p,supportArea(i)[k],mesh.V()[i]);
                 const double f=p.fraction*residue;
@@ -240,9 +313,11 @@ public:
                 retained+=f;
                 if(norm>0){
                     xx+=f*n.x*n.x/(norm*norm);yy+=f*n.y*n.y/(norm*norm);
-                    opticalVolume+=saltgeom::footprintArea(p,mesh.V()[i])*residue*(std::abs(n.x)*dx+std::abs(n.y)*dy)/norm;
+                    const double projection=saltgeom::footprintArea(p,mesh.V()[i])*residue*(std::abs(n.x)*dx+std::abs(n.y)*dy)/norm;
+                    (p.filmArea>0?filmProjection:opticalVolume)+=projection;
                 }else{
-                    xx+=.5*f;yy+=.5*f;opticalVolume+=saltgeom::footprintArea(p,mesh.V()[i])*residue*.5*(dx+dy);
+                    xx+=.5*f;yy+=.5*f;
+                    (p.filmArea>0?filmProjection:opticalVolume)+=saltgeom::footprintArea(p,mesh.V()[i])*residue*.5*(dx+dy);
                 }
             }
             transportFraction[i]=retained;
@@ -252,7 +327,8 @@ public:
                 const double localWater=(totalProduct-retained)*layerProperties.porosity/(1-layerProperties.porosity);
                 water=std::max(0.,water-localWater);
                 const double region=water+retained;
-                const double coverage=region>0?-std::expm1(-opticalVolume/(region*mesh.V()[i])):0;
+                const double filmCoverage=region>0?std::min(1.,filmProjection/(region*mesh.V()[i])):0;
+                const double coverage=region>0?filmCoverage+(1-filmCoverage)*(-std::expm1(-opticalVolume/(region*mesh.V()[i]))):0;
                 const auto layer=saltgeom::retainedConductivity(water,retained,coverage,molecularDiffusivity,layerProperties);
                 // Diagonal tensor closure: exact for grid-aligned laminates.
                 // For oblique populations the off-diagonal transport term is
@@ -419,11 +495,17 @@ public:
             for(int k=0;k<p.n;k++)if(saltgeom::cross(p.vertex[(k+1)%p.n]-p.vertex[k],centre-p.vertex[k])< -1e-12*dx*dy)return false;
             return true;
         };
-        struct Receiver {Foam::label rank=-1,cell=-1,x=0,y=0,hops=3;double resistance=0;std::array<RouteEdge,2> route{};};
+        struct Receiver {Foam::label rank=-1,cell=-1,x=0,y=0,hops=maximumRouteHops+1;double resistance=0;std::array<RouteEdge,maximumRouteHops> route{};};
         std::vector<Receiver> receiver(mesh.nCells());
         forAll(exchange,i){
             localArea[i]={};directLocalArea[i]={};localRoutes[i].clear();support[i]={};reactionNormal[i]={};incoming[i]={};
-            if(containsCentre(shape[i].liquid))receiver[i]={Foam::Pstream::myProcNo(),i,cellIndex[i][0],cellIndex[i][1],0,0};
+            // Optional finite-volume treatment of real cut-cell liquid. The
+            // PLIC liquid polygon excludes epsilonMin-only solid interiors;
+            // such interiors can never become chemical reservoirs here.
+            const bool finiteLiquid=liquidControlVolumeFraction>0&&
+                shape[i].liquid.area()>=liquidControlVolumeFraction*dx*dy;
+            if(containsCentre(shape[i].liquid)||finiteLiquid)
+                receiver[i]={Foam::Pstream::myProcNo(),i,cellIndex[i][0],cellIndex[i][1],0,0};
         }
         struct BoundaryContact {Foam::label source;int direction;saltchem::MineralVector area;};
         std::vector<BoundaryContact> boundaryContacts;
@@ -453,31 +535,31 @@ public:
         }
         const auto& coupled=meshExchange->coupledFaces();
         auto haloReceivers=[&](const std::vector<Receiver>& values){
-            std::vector<Foam::FixedList<Foam::scalar,14>> halo(coupled.size());
+            std::vector<Foam::FixedList<Foam::scalar,6+4*maximumRouteHops>> halo(coupled.size());
             for(std::size_t k=0;k<coupled.size();k++){
                 const auto& r=values[mesh.faceOwner()[coupled[k]]];halo[k][0]=r.rank;halo[k][1]=r.cell;halo[k][2]=r.x;halo[k][3]=r.y;halo[k][4]=r.hops;halo[k][5]=r.resistance;
-                for(int e=0;e<2;e++){for(int axis=0;axis<3;axis++)halo[k][6+4*e+axis]=r.route[e].key[axis];halo[k][9+4*e]=r.route[e].resistance;}
+                for(int e=0;e<maximumRouteHops;e++){for(int axis=0;axis<3;axis++)halo[k][6+4*e+axis]=r.route[e].key[axis];halo[k][9+4*e]=r.route[e].resistance;}
             }
             meshExchange->swapCoupled(halo);return halo;
         };
-        auto neighbourReceiver=[&](int i,int d,const std::vector<Receiver>& values,const std::vector<Foam::FixedList<Foam::scalar,14>>& halo){
+        auto neighbourReceiver=[&](int i,int d,const std::vector<Receiver>& values,const std::vector<Foam::FixedList<Foam::scalar,6+4*maximumRouteHops>>& halo){
             const auto f=directionalFace[i][d];
             if(f<mesh.nInternalFaces())return values[mesh.owner()[f]==i?mesh.neighbour()[f]:mesh.owner()[f]];
             const auto patch=mesh.boundaryMesh().whichPatch(f),k=coupledOffsets[patch]+f-mesh.boundary()[patch].start();const auto& r=halo[k];
             Receiver result{Foam::label(r[0]),Foam::label(r[1]),Foam::label(r[2]),Foam::label(r[3]),Foam::label(r[4]),r[5]};
-            for(int e=0;e<2;e++){for(int axis=0;axis<3;axis++)result.route[e].key[axis]=Foam::label(r[6+4*e+axis]);result.route[e].resistance=r[9+4*e];}
+            for(int e=0;e<maximumRouteHops;e++){for(int axis=0;axis<3;axis++)result.route[e].key[axis]=Foam::label(r[6+4*e+axis]);result.route[e].resistance=r[9+4*e];}
             return result;
         };
         // A bounded cut-cell agglomeration follows actual liquid openings.
         // It never connects two pores through the intervening mineral. Limit
-        // the surface-to-reservoir path to two Cartesian links so the boundary
-        // approximation remains local and converges with grid refinement.
-        for(int hop=1;hop<=2;hop++){
+        // the surface-to-reservoir path to the configured Cartesian-link
+        // budget. Its physical length still vanishes under mesh refinement.
+        for(int hop=1;hop<=routeHops;hop++){
             const auto previous=receiver;const auto halo=haloReceivers(previous);
             forAll(exchange,i)if(previous[i].hops!=0&&shape[i].liquid.area()>0){
                 Receiver best=previous[i];
                 for(int d=0;d<4;d++)if(connected[i][d]&&openArea[i][d]>0){
-                    auto candidate=neighbourReceiver(i,d,previous,halo);if(candidate.rank<0||candidate.hops>=2)continue;
+                    auto candidate=neighbourReceiver(i,d,previous,halo);if(candidate.rank<0||candidate.hops>=routeHops)continue;
                     const int axis=d/2;auto coordinate=cellIndex[i];coordinate[axis]+=(d&1);
                     if(meshExchange->periodicAxes()[axis]&&coordinate[axis]==gridExtent[axis])coordinate[axis]=0;
                     const double resistance=(axis==0?dx:dy)/openArea[i][d];
@@ -490,6 +572,13 @@ public:
                 receiver[i]=best;
             }
         }
+        // A real liquid pocket need not have a large receiver nearby. After
+        // exhausting liquid-only agglomeration, retain its finite inventory
+        // locally. This creates no new pore connection and never admits the
+        // epsilonMin-only water of a geometrically solid cell.
+        if(isolatedLiquidControlVolumes)forAll(exchange,i)
+            if(receiver[i].rank<0&&shape[i].liquid.area()>1e-12*dx*dy)
+                receiver[i]={Foam::Pstream::myProcNo(),i,cellIndex[i][0],cellIndex[i][1],0,0};
         const auto halo=haloReceivers(receiver);
         std::array<bool,7> relevant{};
         for(int j=0;j<7;j++)relevant[j]=kinetics.geometry.weights[j]>0&&(kinetics.neutral[j]>0||kinetics.acid[j]>0||kinetics.co2[j]>0);
@@ -528,14 +617,14 @@ public:
             contacts[link].support[j]+=area;contacts[link].normal[j]=contacts[link].normal[j]+normal*area;
             addPatch(contacts[link].patches);
         };
-        forAll(exchange,i)for(int j=0;j<7;j++)assign(i,receiver[i],j,shape[i].internalArea[j],shape[i].normal[j],2);
+        forAll(exchange,i)for(int j=0;j<7;j++)assign(i,receiver[i],j,shape[i].internalArea[j],shape[i].normal[j],routeHops);
         for(const auto& contact:boundaryContacts){
             const int d=contact.direction;const auto target=neighbourReceiver(contact.source,d,receiver,halo);
             const saltgeom::Point normal=d<2?saltgeom::Point{d==1?1.:-1.,0}:saltgeom::Point{0,d==3?1.:-1.};
-            for(int j=0;j<7;j++)assign(contact.source,target,j,contact.area[j],normal,1);
+            for(int j=0;j<7;j++)assign(contact.source,target,j,contact.area[j],normal,routeHops-1);
         }
         Foam::reduce(inaccessible,Foam::maxOp<int>());
-        if(inaccessible)throw SurfaceTransportModelError("fluidSide surface has no liquid-centred reservoir within two open Cartesian links; resolve the liquid pore or refine the mesh");
+        if(inaccessible)throw SurfaceTransportModelError("fluidSide surface has no liquid-centred reservoir within the configured open-link budget; resolve the liquid pore or refine the mesh");
         int changed=!faceExchange||!faceExchange->matches(surfaceLinks);
         Foam::reduce(changed,Foam::maxOp<int>());
         if(changed)faceExchange=std::make_unique<SurfaceLinkExchange>(mesh,surfaceLinks,dx,dy,meshExchange->periodicAxes());
@@ -581,7 +670,7 @@ public:
         return active;
     }
     void retreatExternal(int i,const saltchem::MineralVector& distance){
-        for(int j=0;j<7;j++)for(int k=0;k<7;k++)if(state[i].population[7*j+k].fraction>0)
+        for(int j=0;j<7;j++)for(int k=0;k<7;k++)if(state[i].population.get(7*j+k).fraction>0)
             state[i].population[7*j+k].retreat+=distance[k];
     }
     // Retire exhausted substrates without changing reactor ownership inside
@@ -617,9 +706,24 @@ public:
         for(int j=0;j<7;j++){
             forAll(exchange,i)exchange[i]=resolved[i][j];exchange.correctBoundaryConditions();neighbours[j]=stencil.values(exchange);
         }
+        std::vector<std::array<saltgeom::Point,7>> fitted;
+        if(fitInterfaceNormal){
+            fitted.resize(mesh.nCells());
+            for(int j=0;j<7;j++){
+                int present=0;for(const auto& f:resolved)present|=f[j]>0;Foam::reduce(present,Foam::maxOp<int>());if(!present)continue;
+                forAll(exchange,i)exchange[i]=neighbours[j][i][0];exchange.correctBoundaryConditions();const auto left=stencil.values(exchange);
+                forAll(exchange,i)exchange[i]=neighbours[j][i][1];exchange.correctBoundaryConditions();const auto right=stencil.values(exchange);
+                forAll(exchange,i){const auto& n=neighbours[j][i];std::array<double,9> patch{{left[i][2],n[2],right[i][2],n[0],resolved[i][j],n[1],left[i][3],n[3],right[i][3]}};
+                    for(double& v:patch)v=std::clamp(v/(1-epsilonMin),0.,1.);
+                    fitted[i][j]=saltgeom::heightFitNormal(patch,dx,dy);
+                }
+            }
+        }
         forAll(exchange,i){
             std::array<std::array<double,4>,7> n;for(int j=0;j<7;j++)n[j]=neighbours[j][i];
-            shape[i]=saltgeom::reconstruct(resolved[i],inert[i],n,state[i].inheritedNormal,dx,dy,mesh.V()[i]/(dx*dy),epsilonMin);
+            auto normals=state[i].inheritedNormal;
+            if(fitInterfaceNormal)for(int j=0;j<7;j++)if(saltgeom::length(normals[j])==0)normals[j]=fitted[i][j];
+            shape[i]=saltgeom::reconstruct(resolved[i],inert[i],n,normals,dx,dy,mesh.V()[i]/(dx*dy),epsilonMin);
             bare[i]=shape[i].internalArea;incoming[i]={};
         }
         if(fluidSide()){reconstructFluidContacts(kinetics);return;}
@@ -720,18 +824,18 @@ public:
         return shape[i].internalArea[j]*measures[i].accessibility[j]+measures[i].capArea[j]+incoming[i][j];
     }
     void seedCell(int i,saltchem::Inventory& cell,const saltchem::MineralVector& si,double dt,const saltchem::MineralVector& volume,double inert,double temperatureK){
-        if(!enabled)return;
+        if(!enabled||(laws.empty()&&state[i].population.empty()))return;
         if(fluidSide()){
             saltchem::MineralVector available{};
             std::array<double,49> prior{};
-            for(int pair=0;pair<49;pair++)prior[pair]=state[i].population[pair].fraction;
+            for(int pair=0;pair<49;pair++)prior[pair]=state[i].population.get(pair).fraction;
             for(int j=0;j<7;j++)available[j]=(incoming[i][j]>0||saltgeom::hasResolvedSubstrate(cell,state[i],j,volume))?1:0;
             saltgeom::nucleate(cell,state[i],laws,si,support[i],dt,mesh.V()[i],volume,epsilonMin,inert,seed,keys[i],productLayer,&available,temperatureK);
             for(int j=0;j<7;j++)for(int k=0;k<7;k++){
-                const double added=state[i].population[7*j+k].fraction-prior[7*j+k];
+                const double added=state[i].population.get(7*j+k).fraction-prior[7*j+k];
                 reactionVectors[i][0]-=added*reactionNormal[i][k].x;
                 reactionVectors[i][1]-=added*reactionNormal[i][k].y;
-                if(state[i].population[7*j+k].fraction>0&&saltgeom::length(reactionNormal[i][k])>0)
+                if(state[i].population.get(7*j+k).fraction>0&&saltgeom::length(reactionNormal[i][k])>0)
                     state[i].inheritedNormal[j]=reactionNormal[i][k];
             }
         }else saltgeom::nucleate(cell,state[i],laws,si,bare[i],dt,mesh.V()[i],volume,epsilonMin,inert,seed,keys[i],productLayer,nullptr,temperatureK);
@@ -751,7 +855,7 @@ public:
         }
         const auto oldCaps=saltgeom::subgrid(state[i]);
         saltgeom::grow(state[i],a,b,localMeasure(i),growth,mesh.V()[i],resolvedRadius,
-            fluidSide()?reactionNormal[i]:shape[i].normal,supportArea(i),productLayer,epsilonMin,nullptr,!fluidSide());
+            fluidSide()?reactionNormal[i]:shape[i].normal,supportArea(i),productLayer,epsilonMin,nullptr,!fluidSide(),resolveNuclei);
         if(fluidSide()){
             const auto newCaps=saltgeom::subgrid(state[i]);saltchem::MineralVector retreat{};
             for(int k=0;k<7;k++)if(support[i][k]>0)
@@ -813,27 +917,30 @@ public:
     void checkpoint(bool write){
         if(!enabled)return;
         const auto path=mesh.time().timePath()/"mineralSurface.bin";
-        const std::uint64_t recordBytes=sizeof(std::uint64_t)+sizeof(saltgeom::SurfaceState)+(fluidSide()?sizeof(saltchem::MineralVector)+sizeof(std::array<double,2>):0);
+        const std::uint64_t modelFlags=(fluidSide()?1ULL:0ULL)|(resolveNuclei?0ULL:2ULL)|(fitInterfaceNormal?4ULL:0ULL)|(isolatedLiquidControlVolumes?8ULL:0ULL);
+        const std::uint64_t legacyBytes=sizeof(std::uint64_t)+sizeof(saltgeom::LegacySurfaceState)+(fluidSide()?sizeof(saltchem::MineralVector)+sizeof(std::array<double,2>):0);
         if(write){
-            std::ofstream f(path.c_str(),std::ios::binary);std::uint64_t h[6]={0x53414c5453555246ULL,6,state.size(),sizeof(saltgeom::SurfaceState),fluidSide()?1ULL:0ULL,recordBytes};
+            const Foam::fileName temporary(path+".tmp");
+            std::ofstream f(temporary.c_str(),std::ios::binary);std::uint64_t h[6]={0x53414c5453555246ULL,8,state.size(),sizeof(saltgeom::Population),modelFlags,0};
             f.write(reinterpret_cast<const char*>(h),sizeof(h));
             for(std::size_t i=0;i<state.size();i++){
-                f.write(reinterpret_cast<const char*>(&keys[i]),sizeof(keys[i]));f.write(reinterpret_cast<const char*>(&state[i]),sizeof(state[i]));
+                saltgeom::writeSurfaceValue(f,keys[i]);saltgeom::writeSurfaceState(f,state[i]);
                 if(fluidSide()){
                     f.write(reinterpret_cast<const char*>(&reactionRates[i]),sizeof(reactionRates[i]));
                     f.write(reinterpret_cast<const char*>(&reactionVectors[i]),sizeof(reactionVectors[i]));
                 }
             }
-            if(!f)throw std::runtime_error("Failed to write mineral surface checkpoint");
+            f.close();
+            if(!f||!Foam::mv(temporary,path))throw std::runtime_error("Failed to write mineral surface checkpoint");
         }else{
             std::ifstream f(path.c_str(),std::ios::binary);std::uint64_t h[6]{};f.read(reinterpret_cast<char*>(h),sizeof(h));
-            if(!f||h[0]!=0x53414c5453555246ULL||h[1]!=6||h[2]!=state.size()||h[3]!=sizeof(saltgeom::SurfaceState)||h[4]!=(fluidSide()?1ULL:0ULL)||h[5]!=recordBytes)
-                throw std::runtime_error("Missing/incompatible mineralSurface.bin restart; version 6 requires saved curvature/film-partition history, reaction rates/vectors, the same surface transport model and mesh/partition");
-            f.seekg(0,std::ios::end);
-            if(f.tellg()!=std::streamoff(sizeof(h)+state.size()*recordBytes))throw std::runtime_error("Truncated/oversized mineralSurface.bin restart");
-            f.seekg(sizeof(h));
+            const bool legacy=h[1]==6;
+            if(!f||h[0]!=0x53414c5453555246ULL||(h[1]!=6&&h[1]!=7&&h[1]!=8)||h[2]!=state.size()||
+               h[3]!=(legacy?sizeof(saltgeom::LegacySurfaceState):h[1]==7?sizeof(saltgeom::PopulationMoments):sizeof(saltgeom::Population))||
+               h[4]!=modelFlags||h[5]!=(legacy?legacyBytes:0))
+                throw std::runtime_error("Missing/incompatible mineralSurface.bin restart; versions 6/7/8 require the same surface transport, nucleus representation and mesh/partition");
             for(std::size_t i=0;i<state.size();i++){
-                std::uint64_t key;f.read(reinterpret_cast<char*>(&key),sizeof(key));f.read(reinterpret_cast<char*>(&state[i]),sizeof(state[i]));
+                std::uint64_t key;saltgeom::readSurfaceValue(f,key);state[i]=saltgeom::readSurfaceState(f,legacy,h[1]==7);
                 if(fluidSide()){
                     f.read(reinterpret_cast<char*>(&reactionRates[i]),sizeof(reactionRates[i]));
                     f.read(reinterpret_cast<char*>(&reactionVectors[i]),sizeof(reactionVectors[i]));
@@ -842,6 +949,7 @@ public:
                 }
                 if(!f||key!=keys[i])throw std::runtime_error("Mineral surface checkpoint mesh mismatch");
             }
+            if(f.peek()!=std::char_traits<char>::eof())throw std::runtime_error("Oversized mineral surface checkpoint");
         }
     }
     void save(const Foam::fileName& output)const {

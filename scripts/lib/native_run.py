@@ -37,7 +37,7 @@ def mesh_fingerprint(work):
     return digest.hexdigest()
 
 
-def execute(work, logs, ranks, threads, timeout, executable=None):
+def execute(work, logs, ranks, threads, timeout, executable=None, *, bind_cores=True):
     work, logs = Path(work).resolve(), Path(logs).resolve()
     executable = Path(executable or ROOT/'bin/saltLakeFoam').resolve()
     if not executable.is_file():
@@ -66,7 +66,7 @@ def execute(work, logs, ranks, threads, timeout, executable=None):
                            (topology/'core_id').read_text().strip()))
             except OSError:
                 pass
-        binding = ['--bind-to', 'core', '--map-by', f'slot:PE={threads}'] if cores and ranks*threads <= len(cores) else ['--bind-to', 'none']
+        binding = ['--bind-to', 'core', '--map-by', f'slot:PE={threads}'] if bind_cores and cores and ranks*threads <= len(cores) else ['--bind-to', 'none']
         run(['mpirun', *binding, '-np', str(ranks), str(executable), '-parallel'], 'solver.log')
     return {'preparation_and_solver_s': time.monotonic()-started,
             'ranks': ranks, 'chemistry_threads_per_rank': threads, 'mesh_sha256': mesh_fingerprint(work)}

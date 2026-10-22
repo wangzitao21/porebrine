@@ -3,6 +3,8 @@
 #include "BrineSystem.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <memory>
+#include <utility>
 #include <vector>
 
 namespace saltgeom {
@@ -66,6 +68,37 @@ inline Interval aperture(const Polygon& p,int side,double dx,double dy){
     }if(out.hi<out.lo)return {};return out;
 }
 inline double overlap(Interval a,Interval b){return std::max(0.,std::min(a.hi,b.hi)-std::max(a.lo,b.lo));}
+// Local height candidates fitted to the nine volume fractions. Unlike a
+// two-neighbour gradient, a planar cut remains a planar cut at every angle.
+// Only cut cells pay for the small geometric fit; no global interface solve.
+inline Point heightFitNormal(const std::array<double,9>& fraction,double dx,double dy){
+    std::array<double,3> columns{},rows{};
+    for(int y=0;y<3;y++)for(int x=0;x<3;x++){columns[x]+=fraction[3*y+x];rows[y]+=fraction[3*y+x];}
+    const double gx=columns[0]-columns[2],gy=rows[0]-rows[2];
+    Point best{gx/dx,gy/dy};double bestError=std::numeric_limits<double>::infinity();
+    if(fraction[4]<=1e-12||fraction[4]>=1-1e-12)return length(best)>0?best*(1/length(best)):Point{};
+    const auto square=box(dx,dy);
+    auto fit=[&](Point normal){
+        if(length(normal)==0)return;
+        normal=normal*(1/length(normal));
+        double lo=std::min(0.,normal.x*dx)+std::min(0.,normal.y*dy);
+        double hi=std::max(0.,normal.x*dx)+std::max(0.,normal.y*dy);
+        for(int iter=0;iter<44;iter++){const double mid=(lo+hi)/2;
+            if(clip(square,normal,mid).area()<fraction[4]*dx*dy)lo=mid;else hi=mid;}
+        const double offset=(lo+hi)/2;double error=0;
+        for(int y=0;y<3;y++)for(int x=0;x<3;x++){
+            const double predicted=clip(square,normal,offset-normal.x*(x-1)*dx-normal.y*(y-1)*dy).area()/(dx*dy);
+            const double diff=predicted-fraction[3*y+x];error+=diff*diff;
+        }
+        if(error<bestError){bestError=error;best=normal;}
+    };
+    fit(best);
+    for(double slope:{columns[1]-columns[0],columns[2]-columns[1],(columns[2]-columns[0])/2})
+        fit({-slope*dy/dx,gy>=0?1.:-1.});
+    for(double slope:{rows[1]-rows[0],rows[2]-rows[1],(rows[2]-rows[0])/2})
+        fit({gx>=0?1.:-1.,-slope*dx/dy});
+    return best;
+}
 struct Reconstruction {
     std::array<Polygon,8> solid;Polygon liquid;
     std::array<Point,7> normal{};MineralVector internalArea{};
@@ -101,7 +134,8 @@ inline double exponential(std::uint64_t seed,std::uint64_t cell,int pair,std::ui
     const auto bits=mix(seed^mix(cell)^mix(std::uint64_t(pair))^mix(event+0xa174));
     return -std::log((double(bits>>11)+.5)/9007199254740992.);
 }
-struct Population {
+// Stable pre-film layout, also used by the version 6/7 checkpoint reader.
+struct PopulationMoments {
     double fraction=0,count=0,hazard=0,threshold=0;
     std::uint64_t events=0;
     // Population-mean birth support and subsequent normal recession. These
@@ -117,12 +151,59 @@ struct Population {
     double localShare=1,partitionSupport=-1;
     Point birthNormal{};
 };
+struct Population : PopulationMoments {
+    // Positive for a planar, fixed-footprint patch; zero for spherical caps.
+    // Coplanar film patches on one substrate are disjoint (a mineral mosaic).
+    // Normal growth/dissolution changes thickness, not this reference area.
+    double filmArea=0;
+};
 inline void clearPopulationMaterial(Population& p){
     const double hazard=p.hazard,threshold=p.threshold;const auto events=p.events;
     p=Population{};p.hazard=hazard;p.threshold=threshold;p.events=events;
 }
+// Missing pairs have the exact default state. Read-only access never allocates;
+// mutable access retains waiting-time history even after the mineral vanishes.
+// Pointees stay valid when another pair is inserted, as with the former array.
+class PopulationTable {
+    std::uint64_t present_=0;
+    std::vector<std::unique_ptr<Population>> values_;
+    static std::uint64_t bit(int pair){
+        if(pair<0||pair>=49)throw std::out_of_range("Invalid mineral population pair");
+        return std::uint64_t(1)<<pair;
+    }
+    std::size_t position(std::uint64_t b)const {return __builtin_popcountll(present_&(b-1));}
+public:
+    PopulationTable()=default;
+    PopulationTable(const PopulationTable& other):present_(other.present_){
+        values_.reserve(other.values_.size());
+        for(const auto& p:other.values_)values_.emplace_back(new Population(*p));
+    }
+    PopulationTable(PopulationTable&& other)noexcept:
+        present_(std::exchange(other.present_,0)),values_(std::move(other.values_)){}
+    PopulationTable& operator=(PopulationTable other)noexcept{
+        std::swap(present_,other.present_);values_.swap(other.values_);return *this;
+    }
+    bool empty()const {return present_==0;}
+    std::size_t size()const {return values_.size();}
+    std::uint64_t mask()const {return present_;}
+    Population* find(int pair){
+        const auto b=bit(pair);return present_&b?values_[position(b)].get():nullptr;
+    }
+    const Population& get(int pair)const{
+        const auto b=bit(pair);static const Population absent{};
+        return present_&b?*values_[position(b)]:absent;
+    }
+    const Population& operator[](int pair)const {return get(pair);}
+    Population& operator[](int pair){
+        const auto b=bit(pair);const auto at=position(b);
+        if(!(present_&b)){
+            values_.insert(values_.begin()+at,std::make_unique<Population>());present_|=b;
+        }
+        return *values_[at];
+    }
+};
 struct SurfaceState {
-    std::array<Population,49> population{};
+    PopulationTable population;
     std::array<Point,7> inheritedNormal{};
     MineralVector births{},promotions{};
 };
@@ -178,7 +259,7 @@ struct NucleationLaw {
             throw std::invalid_argument("Physical CNT requires an explicitly supplied positive interfacialEnergy in J/m2");
     }
 };
-inline MineralVector subgrid(const SurfaceState& s){MineralVector f{};for(int j=0;j<7;j++)for(int k=0;k<7;k++)f[j]+=s.population[7*j+k].fraction;return f;}
+inline MineralVector subgrid(const SurfaceState& s){MineralVector f{};if(s.population.empty())return f;for(int j=0;j<7;j++)for(int k=0;k<7;k++)f[j]+=s.population[7*j+k].fraction;return f;}
 inline bool whollySubgrid(double total,double caps){
     return total==0?caps==0:caps>0&&std::abs(total-caps)<=64*std::numeric_limits<double>::epsilon()*std::max(total,caps);
 }
@@ -188,22 +269,22 @@ inline bool whollySubgrid(double total,double caps){
 inline void alignPureSubgridInventory(SurfaceState& surface,int mineral,double totalFraction){
     int largest=-1;double sum=0;
     for(int k=0;k<7;k++){
-        const auto& p=surface.population[7*mineral+k];sum+=p.fraction;
-        if(p.fraction>0&&(largest<0||p.fraction>surface.population[7*mineral+largest].fraction))largest=k;
+        const auto& p=surface.population.get(7*mineral+k);sum+=p.fraction;
+        if(p.fraction>0&&(largest<0||p.fraction>surface.population.get(7*mineral+largest).fraction))largest=k;
     }
     const double budget=64*std::numeric_limits<double>::epsilon()*std::max(totalFraction,sum);
     if(!std::isfinite(totalFraction)||totalFraction<0||std::abs(totalFraction-sum)>budget)
         throw std::runtime_error("Pure subgrid geometry exceeds the single-update roundoff budget");
     if(largest<0){if(totalFraction!=0)throw std::runtime_error("No cap remains to represent pure subgrid inventory");return;}
-    long double other=0;for(int k=0;k<7;k++)if(k!=largest)other+=surface.population[7*mineral+k].fraction;
+    long double other=0;for(int k=0;k<7;k++)if(k!=largest)other+=surface.population.get(7*mineral+k).fraction;
     const double corrected=double(static_cast<long double>(totalFraction)-other);
     if(corrected<0)throw std::runtime_error("Pure subgrid alignment would consume another population");
     surface.population[7*mineral+largest].fraction=corrected;
 }
 inline double radius(const Population& p,double cellVolume){return p.count>0&&p.fraction>0?std::cbrt(p.fraction*cellVolume/(capVolumeFactor(p.heightFactor)*p.count)):0;}
-inline double capHeight(const Population& p,double cellVolume){return p.heightFactor*radius(p,cellVolume);}
-inline double outerArea(const Population& p,double cellVolume){const double r=radius(p,cellVolume);return capOuterAreaFactor(p.heightFactor)*r*r*p.count;}
-inline double footprintArea(const Population& p,double cellVolume){const double r=radius(p,cellVolume);return capFootprintFactor(p.heightFactor)*r*r*p.count;}
+inline double capHeight(const Population& p,double cellVolume){return p.filmArea>0?p.fraction*cellVolume/p.filmArea:p.heightFactor*radius(p,cellVolume);}
+inline double outerArea(const Population& p,double cellVolume){if(p.fraction<=0)return 0;if(p.filmArea>0)return p.filmArea;const double r=radius(p,cellVolume);return capOuterAreaFactor(p.heightFactor)*r*r*p.count;}
+inline double footprintArea(const Population& p,double cellVolume){if(p.fraction<=0)return 0;if(p.filmArea>0)return p.filmArea;const double r=radius(p,cellVolume);return capFootprintFactor(p.heightFactor)*r*r*p.count;}
 inline double capExtent(const Population& p,double cellVolume){return radius(p,cellVolume)*std::max(p.heightFactor,std::sqrt(p.heightFactor*(2-p.heightFactor)));}
 struct ProductLayer {
     bool enabled=false,crossGrid=false;
@@ -292,7 +373,9 @@ inline double attachedShare(const Population& p,double bare,double cellVolume){
 // A single population cannot resolve distinct same-mineral patches; the
 // normal guard rejects an obvious reversal, not every possible identity change.
 inline void updatePartition(SurfaceState& s,const MineralVector& support,const std::array<Point,7>& normal){
+    if(s.population.empty())return;
     for(int j=0;j<7;j++)for(int k=0;k<7;k++){
+        if(!s.population.find(7*j+k))continue;
         auto& p=s.population[7*j+k];if(!(p.fraction>0&&p.count>0))continue;
         if(!std::isfinite(support[k])||support[k]<0||!std::isfinite(p.localShare)||p.localShare<0||p.localShare>1)
             throw std::invalid_argument("Invalid interfacial-film partition");
@@ -325,9 +408,11 @@ struct SurfaceMeasure {
 // population closure (Boolean coverage), not resolved individual crystals.
 // It preserves solid volume even when footprints overlap or populations merge.
 inline SurfaceMeasure measure(const SurfaceState& s,const MineralVector& bare,double cellVolume,bool blocking=true,const ProductLayer& layer={}){
-    SurfaceMeasure r;std::array<double,49> projected{},outer{},share{},domain{},logUncovered{};
-    MineralVector reference{},localVolume{};
+    SurfaceMeasure r;
     r.accessibility.fill(1);r.layerTransmission.fill(1);
+    if(s.population.empty()){r.exposed=bare;return r;}
+    std::array<double,49> projected{},outer{},share{},domain{},logUncovered{},filmCovered{};
+    MineralVector reference{},localVolume{};
     for(int j=0;j<7;j++)for(int k=0;k<7;k++){
         const int id=7*j+k;const auto& p=s.population[id];
         if(!(p.fraction>0&&p.count>0))continue;
@@ -339,7 +424,8 @@ inline SurfaceMeasure measure(const SurfaceState& s,const MineralVector& bare,do
         if(share[id]>0&&projected[id]>0){
             domain[id]=std::min(bare[k],partitionReference(p,bare[k]));
             const double optical=projected[id]*share[id]/domain[id];
-            logUncovered[id]=layer.enabled?-optical:
+            if(p.filmArea>0)filmCovered[id]=std::min(1.,optical);
+            else logUncovered[id]=layer.enabled?-optical:
                 (optical>=p.count?-1e300:p.count*std::log1p(-optical/p.count));
         }
     }
@@ -349,8 +435,11 @@ inline SurfaceMeasure measure(const SurfaceState& s,const MineralVector& bare,do
         // closure, not stored coordinates of individual crystal contacts.
         std::array<double,7> ends{};for(int j=0;j<7;j++)ends[j]=domain[7*j+k];std::sort(ends.begin(),ends.end());
         double start=0,coveredArea=0;
-        for(double end:ends)if(end>start){double logEmpty=0;for(int j=0;j<7;j++)if(domain[7*j+k]>=end)logEmpty+=logUncovered[7*j+k];
-            coveredArea+=(end-start)*(-std::expm1(logEmpty));start=end;}
+        for(double end:ends)if(end>start){double logEmpty=0,filmFraction=0;
+            for(int j=0;j<7;j++)if(domain[7*j+k]>=end){logEmpty+=logUncovered[7*j+k];filmFraction+=filmCovered[7*j+k];}
+            // Disjoint film patches, with random caps on the remaining area.
+            const double sheet=std::min(1.,filmFraction);
+            coveredArea+=(end-start)*(sheet+(1-sheet)*(-std::expm1(logEmpty)));start=end;}
         const double covered=bare[k]>0?std::clamp(coveredArea/bare[k],0.,1.):0;
         r.coverage[k]=r.layerCoverage[k]=covered;
         const double porosity=layer.enabled?layer.porosity:0;
@@ -366,7 +455,7 @@ inline SurfaceMeasure measure(const SurfaceState& s,const MineralVector& bare,do
         for(int j=0;j<7;j++)if(outer[7*j+k]>0){
             // Crowding of the product's outer surface is independent of the
             // bookkeeping split and never vanishes with its primary support.
-            const double a=outer[7*j+k]*(ref>0&&f>0&&projected[7*j+k]>0&&(layer.enabled||share[7*j+k]>0)?ref*birthCovered/f:1);
+            const double a=outer[7*j+k]*(s.population[7*j+k].filmArea==0&&ref>0&&f>0&&projected[7*j+k]>0&&(layer.enabled||share[7*j+k]>0)?ref*birthCovered/f:1);
             r.populationArea[7*j+k]=a;r.capArea[j]+=a;
         }
     }
@@ -396,7 +485,8 @@ inline bool addEmbryo(saltchem::Inventory& cell,SurfaceState& surface,const Nucl
     const double moles=std::exp(logMoles),fraction=moles*molarVolume[law.product];
     if(!std::isfinite(fraction)||!std::isfinite(moles)||!(fraction>0&&moles>0))return false;
     auto& p=surface.population[7*law.product+law.substrate];
-    double oldCaps=0;for(int k=0;k<7;k++)oldCaps+=surface.population[7*law.product+k].fraction;
+    if(p.filmArea>0)throw std::invalid_argument("A fixed-footprint film cannot merge new spherical-cap nuclei into the same population");
+    double oldCaps=0;for(int k=0;k<7;k++)oldCaps+=surface.population.get(7*law.product+k).fraction;
     const bool purelySubgrid=whollySubgrid(cell.mineral[law.product]*molarVolume[law.product],oldCaps);
     if(p.count>0&&p.heightFactor!=heightFactor)
         throw std::invalid_argument("Cannot change contact angle of an existing mineral population");
@@ -464,12 +554,18 @@ inline void nucleate(saltchem::Inventory& cell,SurfaceState& surface,const std::
     }
 }
 inline void promoteResolvedPopulations(SurfaceState& surface,double cellVolume,double resolution,
-                                      const std::array<Point,7>& normal){
+                                      const std::array<Point,7>& normal,bool resolve=true){
     if(!std::isfinite(cellVolume)||cellVolume<=0||!std::isfinite(resolution)||resolution<=0)
         throw std::invalid_argument("Invalid resolved cap transition scale");
+    // A population has volume and area moments, but no footprint coordinates.
+    // Its radius alone cannot justify replacing it by a cell-spanning plane.
+    // The population closure retains these moments, including after support
+    // loss; it does not claim to resolve individual crystal fronts.
+    if(!resolve)return;
     for(int j=0;j<7;j++)for(int k=0;k<7;k++){
+        if(!surface.population.find(7*j+k))continue;
         auto& p=surface.population[7*j+k];
-        if(p.fraction>0&&capExtent(p,cellVolume)>=resolution){
+        if(p.filmArea==0&&p.fraction>0&&capExtent(p,cellVolume)>=resolution){
             if(length(normal[k])>0)surface.inheritedNormal[j]=normal[k];
             surface.promotions[j]+=p.count;clearPopulationMaterial(p);
         }
@@ -486,7 +582,7 @@ inline MineralVector inaccessibleFractions(const SurfaceState& s,const MineralVe
 inline void grow(SurfaceState& s,const MineralVector& before,const MineralVector& after,
     const SurfaceMeasure& measured,const MineralVector& totalGrowthArea,double cellVolume,double resolution,
     const std::array<Point,7>& normal,const MineralVector& bare={},const ProductLayer& layer={},double epsilonMin=0,
-    const std::array<bool,7>* externalSupport=nullptr,bool updateSubstrateRetreat=true){
+    const std::array<bool,7>* externalSupport=nullptr,bool updateSubstrateRetreat=true,bool resolve=true){
     const auto old=subgrid(s);MineralVector resolvedBefore{},resolvedAfter{};
     for(int j=0;j<7;j++){
         const double delta=after[j]-before[j];
@@ -501,7 +597,7 @@ inline void grow(SurfaceState& s,const MineralVector& before,const MineralVector
         double accessible=resolvedArea>0?resolvedBefore[j]:0,slope=resolvedArea/cellVolume,maxRetreat=0;
         if(resolvedArea>0)maxRetreat=resolvedBefore[j]*cellVolume/resolvedArea;
         for(int k=0;k<7;k++){
-            const auto& p=s.population[7*j+k];fraction[k]=p.fraction;area[k]=measured.populationArea[7*j+k];
+            const auto& p=s.population.get(7*j+k);fraction[k]=p.fraction;area[k]=measured.populationArea[7*j+k];
             if(p.fraction>0&&p.count>0&&area[k]>0){
                 // dV=A_eff*dl and dV/dR=3V/R for a fixed-contact-angle cap.
                 // At equal exposure, equal-angle caps have the same dR.
@@ -542,6 +638,7 @@ inline void grow(SurfaceState& s,const MineralVector& before,const MineralVector
         resolvedAfter[j]=std::max(0.,resolvedBefore[j]+resolvedArea*distance/cellVolume);
         int correction=-1;double sum=0;
         for(int k=0;k<7;k++){
+            if(!s.population.find(7*j+k))continue;
             auto& p=s.population[7*j+k];
             if(inverseLength[k]>0){const double ratio=std::max(0.,1+distance*inverseLength[k]);p.fraction=fraction[k]*ratio*ratio*ratio;
                 if(p.fraction>0&&(correction<0||p.fraction>s.population[7*j+correction].fraction))correction=k;}
@@ -558,6 +655,7 @@ inline void grow(SurfaceState& s,const MineralVector& before,const MineralVector
         }
     }
     for(int j=0;j<7;j++)for(int k=0;k<7;k++){
+            if(!s.population.find(7*j+k))continue;
             auto& p=s.population[7*j+k];
             if(p.fraction==0){clearPopulationMaterial(p);continue;}
             if(layer.enabled){
@@ -569,7 +667,7 @@ inline void grow(SurfaceState& s,const MineralVector& before,const MineralVector
             }
             // Legacy mode resolves a population when its support disappears.
             // Porous mode retains its subgrid reacting area until resolution.
-            if(capExtent(p,cellVolume)>=resolution||(!layer.enabled&&updateSubstrateRetreat&&resolvedAfter[k]==0&&!(externalSupport&&(*externalSupport)[k]))){
+            if(resolve&&(capExtent(p,cellVolume)>=resolution||(!layer.enabled&&updateSubstrateRetreat&&resolvedAfter[k]==0&&!(externalSupport&&(*externalSupport)[k])))){
                 if(length(normal[k])>0)s.inheritedNormal[j]=normal[k];
                 s.promotions[j]+=p.count;clearPopulationMaterial(p);
             }

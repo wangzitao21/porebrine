@@ -34,6 +34,38 @@ int main(){try{
     }
     std::cout<<"contact_angle_volume_footprint_and_area,1\n";
     {
+        // A new wet front must be able to start both products from zero.
+        // Old products remain at their birth location; they do not seed or
+        // cover a different cell just because the primary front has moved.
+        MineralVector volumes{},si{},bare{},absent{};volumes.fill(2.7e-5);
+        si[0]=si[1]=.3;bare[2]=supportArea;
+        const std::vector<NucleationLaw> laws{{0,2,1e12,0,60,1e-8},{1,2,1e12,0,60,1e-8}};
+        Inventory wet;wet.waterEquivalent=1000;wet.aqueous.fill(1000);wet.mineral[2]=.5/volumes[2];
+        const auto mass=conserved(wet);SurfaceState oldFront,newFront;
+        auto oldCell=wet;
+        nucleate(oldCell,oldFront,laws,si,bare,1,cellVolume,volumes,1e-5,0,2024,11);
+        require(oldFront.births[0]>0&&oldFront.births[1]>0,"Fresh outer interface could not nucleate both products");
+        auto closed=wet;
+        nucleate(closed,newFront,laws,si,{},1,cellVolume,volumes,1e-5,0,2024,12);
+        require(newFront.births[0]==0&&newFront.births[1]==0,"Numerical water inside an unexposed solid nucleated a product");
+        auto noSubstrate=wet;
+        nucleate(noSubstrate,newFront,laws,si,bare,1,cellVolume,volumes,1e-5,0,2024,12,{},&absent);
+        require(newFront.births[0]==0&&newFront.births[1]==0,"Vanished substrate supported fresh nucleation");
+        MineralVector undersaturated{};undersaturated.fill(-.1);
+        auto cold=wet;
+        nucleate(cold,newFront,laws,undersaturated,bare,1,cellVolume,volumes,1e-5,0,2024,12);
+        require(newFront.births[0]==0&&newFront.births[1]==0,"Undersaturated new interface nucleated products");
+        updatePartition(oldFront,{},{});
+        const auto residue=subgrid(oldFront);
+        auto newlyWet=wet;
+        nucleate(newlyWet,newFront,laws,si,bare,1,cellVolume,volumes,1e-5,0,2024,12);
+        require(newFront.births[0]>0&&newFront.births[1]>0,"Newly exposed interior needed pre-existing product seeds");
+        require(subgrid(oldFront)==residue,"Interior birth transported old exterior products");
+        const auto now=conserved(newlyWet);for(int j=0;j<8;j++)close(mass[j],now[j],3e-14,"Fresh-front birth lost conserved inventory");
+        require(measure(oldFront,{},cellVolume).attachedFraction[0]==0,"Old residue remained attached after support vanished");
+        std::cout<<"fresh_front_births_without_precoating_and_dry_solid_guards,1\n";
+    }
+    {
         MineralVector volumes{};volumes.fill(2.7e-5);
         Inventory cell;cell.waterEquivalent=1000;cell.aqueous.fill(1000);cell.mineral[2]=cell.mineral[3]=.1/volumes[2];
         NucleationLaw first{0,2,1e12,0,45,1e-8},second{0,3,1e12,0,120,7e-9};

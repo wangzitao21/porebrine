@@ -10,13 +10,13 @@ from lib.case_input import case_path, default_config, input_hashes, read_inputs,
 
 
 def create(reference, template=None, config_file=None, geometry_file=None, initial_file=None,
-           nx=16, ny=8, spacing=1e-5):
+           nx=16, ny=8, spacing=1e-5, dual_geometry_file=None):
     destination = case_path(reference, create=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.prepare-', dir=destination.parent) as temporary:
         source = Path(temporary)/'input_data'
         if template:
-            if any((config_file, geometry_file, initial_file)):
+            if any((config_file, geometry_file, initial_file, dual_geometry_file)):
                 raise ValueError('--template cannot be combined with separate input files')
             template = Path(template)
             if not template.exists():
@@ -38,6 +38,8 @@ def create(reference, template=None, config_file=None, geometry_file=None, initi
                 np.savez_compressed(source/'geometry.npz', solid_fractions=np.zeros((8, m['ny'], m['nx'])))
             if initial_file:
                 shutil.copy2(initial_file, source/'initial_conditions.npz')
+            if dual_geometry_file:
+                shutil.copy2(dual_geometry_file, source/'dual_geometry.bin')
         config, _, _ = read_inputs(source)
         destination.mkdir()  # No replacement of existing cases or their run history.
         shutil.move(str(source), str(destination/'input_data'))
@@ -52,13 +54,14 @@ def main():
     parser.add_argument('--config', type=Path, help='Scientific config.json')
     parser.add_argument('--geometry', type=Path, help='geometry.npz: solid_fractions[Halite,Sylvite,Carnallite,Polyhalite,Gypsum,Bischofite,Calcite,inert,y,x]')
     parser.add_argument('--initial-conditions', type=Path, help='Optional component molalities [y,x], pressure_Pa [y,x], velocity_m_s [y,x,2]')
+    parser.add_argument('--dual-geometry', type=Path, help='Fine mineral polygon geometry for dualMineralGeometry')
     parser.add_argument('--nx', type=int, default=16)
     parser.add_argument('--ny', type=int, default=8)
     parser.add_argument('--spacing-m', type=float, default=1e-5)
     args = parser.parse_args()
     try:
         path, config = create(args.case, args.template, args.config, args.geometry,
-                              args.initial_conditions, args.nx, args.ny, args.spacing_m)
+                              args.initial_conditions, args.nx, args.ny, args.spacing_m, args.dual_geometry)
     except (ValueError, OSError, KeyError) as error:
         parser.error(str(error))
     size = sum(p.stat().st_size for p in (path/'input_data').iterdir())

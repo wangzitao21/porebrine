@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "MineralInterface.hpp"
+#include "SurfaceStateIO.hpp"
 #include <iostream>
 #include <iomanip>
-#include <cstring>
+#include <sstream>
 #include <cfenv>
 using namespace saltgeom;
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
@@ -48,8 +49,9 @@ int main(){try{
     close(m.residueFraction[0],oldFraction,1e-14,"New nucleation changed old residual mass");
     auto reverse=initial;auto reversed=normals;reversed[2]={-1,0};updatePartition(reverse,support,reversed);
     updatePartition(reverse,support,normals);require(reverse.population[2].localShare==0,"Direction reversal reattached a different interface");
-    // A raw state copy is the same data carried by checkpoints and rollback.
-    SurfaceState restored;std::memcpy(&restored,&state,sizeof(state));
+    std::stringstream checkpoint(std::ios::in|std::ios::out|std::ios::binary);
+    writeSurfaceState(checkpoint,state);
+    SurfaceState restored=readSurfaceState(checkpoint);
     const auto read=measure(restored,support,volume,true,layer);
     require(read.attachedFraction==m.attachedFraction&&read.residueFraction==m.residueFraction,"Partition state was not checkpoint complete");
     auto multiple=initial;multiple.population[9]=multiple.population[2];multiple.population[9].supportArea=area*.5;

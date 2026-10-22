@@ -3,6 +3,7 @@
 #include "fvCFD.H"
 #include "BrineSystem.hpp"
 #include "MineralInterface.hpp"
+#include "DualMineralGeometry.hpp"
 
 namespace saltflow {
 struct StepConvergenceFailure:std::runtime_error {using std::runtime_error::runtime_error;};
@@ -37,6 +38,8 @@ struct FlowState {
     std::vector<saltgeom::SurfaceState> mineralSurface;
     std::vector<saltchem::MineralVector> mineralSurfaceRates;
     std::vector<std::array<double,2>> mineralSurfaceVectors;
+    std::shared_ptr<saltdual::Geometry> dualGeometry;
+    std::vector<std::array<double,2>> dualGeometryVectors;
     FlowState(const Foam::Time& time,const Foam::volScalarField& pressure,
               const Foam::volScalarField& porosity,const Foam::volScalarField& density,
               const Foam::volVectorField& velocity,const Foam::surfaceScalarField& volumeFlux,

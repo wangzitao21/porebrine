@@ -72,6 +72,37 @@ int main(int argc,char** argv){
         grow(promoted,before,after,measure(single,bare,v),total,v,r,normals);
         require(subgrid(promoted)[0]==0&&promoted.promotions[0]==1,"Resolved transition failed");close(after[0],before[0],1e-15,"Promotion changed mass");
         std::cout<<"conservative_promotion,1\n";
+        {
+            // Retaining moments must work after crossing the old radius
+            // threshold and after substrate depletion. Neither event supplies
+            // the footprint coordinates needed for a resolved planar front.
+            auto retainedPopulation=single;
+            const auto stock=subgrid(retainedPopulation);
+            promoteResolvedPopulations(retainedPopulation,v,r*.1,normals,false);
+            require(subgrid(retainedPopulation)==stock&&retainedPopulation.promotions[0]==0,
+                    "Population representation implicitly created a resolved plane");
+            MineralVector prior{},next{};prior[0]=stock[0];prior[2]=.4;
+            next=prior;next[2]=0;
+            auto measureBefore=measure(retainedPopulation,bare,v);
+            grow(retainedPopulation,prior,next,measureBefore,measureBefore.exposed,v,r*.1,
+                 normals,bare,{},ep,nullptr,true,false);
+            close(subgrid(retainedPopulation)[0],stock[0],1e-15,"Support loss changed retained product volume");
+            require(retainedPopulation.promotions[0]==0,"Support loss promoted a retained population");
+            MineralVector resolved=next;resolved[0]-=subgrid(retainedPopulation)[0];
+            const auto noPlane=reconstruct(resolved,0,neighbours,normals,h,h,h,ep);
+            require(noPlane.solid[0].n==0&&noPlane.internalArea[0]==0,
+                    "Retained population generated a spurious PLIC growth face");
+            auto surface=measure(retainedPopulation,MineralVector{},v);
+            require(surface.exposed[0]>0,"Retained product lost its independent reactive surface");
+            prior=next;next[0]*=8;
+            grow(retainedPopulation,prior,next,surface,surface.exposed,v,r*.1,
+                 normals,{}, {},ep,nullptr,true,false);
+            close(subgrid(retainedPopulation)[0],next[0],2e-15,"Retained growth lost volume");
+            require(retainedPopulation.promotions[0]==0,"Growing population was silently resolved");
+            const auto grownSurface=measure(retainedPopulation,MineralVector{},v);
+            close(grownSurface.exposed[0]/surface.exposed[0],4,2e-14,"Retained crystal area-volume law");
+            std::cout<<"retained_population_growth_and_support_loss,1\n";
+        }
         auto exactSubgrid=single;MineralVector grown=after;
         for(int step=0;step<20;step++){
             auto prior=grown;grown[0]*=1.17;

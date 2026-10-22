@@ -36,9 +36,16 @@ def validate_result(run_directory):
     initial, final = (read_frame(run_directory, stamp) for stamp in (stamps[0], stamps[-1]))
     if len(initial) != n or len(final) != n or not np.array_equal(initial[:, :2], final[:, :2]):
         raise ValueError('Snapshot cell coordinates changed')
-    for values in (initial, final):
+    for stamp, values in ((stamps[0], initial), (stamps[-1], final)):
         phases = values[:, [COLUMNS.index(name) for name in ['epsilon', *('Halite', 'Sylvite', 'Carnallite', 'Polyhalite', 'Gypsum', 'Bischofite', 'Calcite'), 'inert']]]
-        if np.min(phases) < -1e-6 or np.max(np.abs(phases.sum(axis=1)-1)) > 2e-6:
+        retained = np.zeros(n)
+        if config.get('advanced', {}).get('dualMineralGeometry', False):
+            diagnostics = np.atleast_1d(np.genfromtxt(run_directory/f'data/dual_geometry/{stamp}.csv', delimiter=',', names=True))
+            local = np.zeros(n);local[diagnostics['cell'].astype(int)] = diagnostics['closed_water_fraction']
+            h = config['mesh']['spacing_m']
+            owners = np.rint(values[:, 0]/h-.5).astype(int)+config['mesh']['nx']*np.rint(values[:, 1]/h-.5).astype(int)
+            retained = local[owners]
+        if np.min(phases) < -1e-6 or np.max(np.abs(phases.sum(axis=1)+retained-1)) > 2e-6:
             raise ValueError('Mineral and pore volume fractions do not close')
     h = history(run_directory)
     if abs(h['time_s'][0]) > 1e-12 or abs(h['time_s'][-1]-target) > 1e-10 or np.any(np.diff(h['time_s']) <= 0):

@@ -50,6 +50,8 @@ def export(work, run_directory):
     for name in ('summary.csv', 'history.csv', 'boundary_history.csv', 'time_steps.csv'):
         shutil.move(str(output_parts[0]/name), data/name)
     interface_parts = [folder/'interfaces' for folder in output_parts]
+    if (output_parts[0]/'dual_geometry').is_dir():
+        shutil.move(str(output_parts[0]/'dual_geometry'), data/'dual_geometry')
     if any(folder.exists() for folder in interface_parts):
         if not all(folder.exists() for folder in interface_parts):
             raise ValueError('Missing interface diagnostics on an MPI rank')
@@ -90,7 +92,7 @@ def export(work, run_directory):
             if path.is_file() and '__pycache__' not in path.parts:
                 writer.writerow([path.relative_to(ROOT), path.stat().st_size, sha256(path)])
     settings = {str(path.relative_to(work)): path.read_text()
-                for folder in ('constant', 'system') for path in (work/folder).glob('*') if path.is_file()}
+                for folder in ('constant', 'system') for path in (work/folder).glob('*') if path.is_file() and path.suffix != '.bin'}
     (record/'generated_settings.json').write_text(json.dumps(settings, indent=2)+'\n', encoding='utf-8')
     (record/'data_format.json').write_text(json.dumps({
         'byte_order': 'little-endian', 'header': 'four uint32 values: magic, version, cells, columns',

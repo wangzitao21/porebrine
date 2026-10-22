@@ -274,5 +274,27 @@ int main(int argc,char** argv){try{
         }
         std::cout<<"extreme_composite_surface_weights,1\n";
     }
+    {
+        // A saturated product must remain inactive while a different mineral
+        // dissolves into the same brine. Exercise the coupled implicit solve,
+        // rather than the all-zero-rate fast path of a single mineral.
+        auto tolerance=options;tolerance.relativeTolerance=2e-8;
+        for(double salinity:{6.2,6.5,7.0})for(double duration:{.001,.01,.1}){
+            auto fluid=spec.inventory({{salinity,.1,0,.1,salinity+.3,0,0}},.001,{});
+            Inventory primary;primary.mineral[Halite]=.001752;primary.mineral[Carnallite]=.002;
+            primary.waterEquivalent=.001;
+            MineralVector exposed{},caps{};exposed[Halite]=exposed[Carnallite]=area;caps[Halite]=.000048;
+            auto coupledRates=rates;coupledRates.neutral[Carnallite]=.05;
+            const auto beforeSolid=primary,beforeFluid=fluid;
+            const auto result=advanceSurfaceDissolution(reaction,primary,fluid,coupledRates,
+                exposed,caps,model.molarVolume,volume,duration,tolerance);
+            require(result.dissolved[Carnallite]>0,"Coupled hydrate did not react");
+            require(result.dissolved[Halite]>=0&&primary.mineral[Halite]<=beforeSolid.mineral[Halite],
+                "Dissolution-only operator generated a product mineral");
+            require(result.dissolved[Halite]<1e-12,"Supersaturated product dissolved in the coupled brine");
+            balance(beforeSolid,beforeFluid,primary,fluid);
+        }
+        std::cout<<"coupled_one_way_surface_extent,1\n";
+    }
     std::cout<<"all_passed,1\n";
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

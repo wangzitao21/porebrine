@@ -60,8 +60,13 @@ inline SurfaceReactionResult advanceSurfaceDissolution(
         const double extent=initial.mineral[j]-reacted.mineral[j];
         const double available=initial.mineral[j]-lockedCaps[j];
         const double roundoff=64*std::numeric_limits<double>::epsilon()*std::max(initial.mineral[j],reacted.mineral[j]);
-        if(extent< -roundoff||extent>available+roundoff)
-            throw std::runtime_error("Dissolution-only surface step exceeded accessible mineral bounds");
+        if(extent< -roundoff||extent>available+roundoff){
+            std::ostringstream message;message<<std::setprecision(17)
+                <<"Dissolution-only surface step exceeded accessible mineral bounds: mineral="<<mineralNames[j]
+                <<" initial="<<initial.mineral[j]<<" reacted="<<reacted.mineral[j]
+                <<" locked="<<lockedCaps[j]<<" extent="<<extent<<" roundoff="<<roundoff;
+            throw std::runtime_error(message.str());
+        }
         result.dissolved[j]=std::clamp(extent,0.,available);
         result.retreat[j]=faceArea[j]>0?result.dissolved[j]*molarVolume[j]*cellVolume/(bulkVolume*faceArea[j]):0;
     }

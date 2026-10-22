@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>光卤石溶蚀与次生沉淀 · 二维数值实验</title>
+<style>
+:root{color-scheme:light;--ink:#23343d;--muted:#586b75;--line:#d8e3e7;--blue:#087db4;--gold:#bd7100;--rock:#4d555e;--paper:#f4f8fa}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}
+main{max-width:1320px;margin:0 auto;padding:28px 28px 40px}h1{font-size:27px;line-height:1.35;margin:0 0 8px;font-weight:650}h2{font-size:18px;margin:0}h3{font-size:16px;margin:8px 0}
+p{margin:6px 0}.muted{color:var(--muted)}.eyebrow{font-size:12px;letter-spacing:.13em;color:var(--blue);margin-bottom:8px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:18px 0 10px}button,select{font:inherit;border:1px solid #b7cad3;border-radius:6px;background:white;color:var(--ink);padding:7px 12px;min-height:38px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}button.primary{background:#12688b;border-color:#12688b;color:white;min-width:86px}input[type=range]{width:100%;accent-color:#12688b;cursor:ew-resize}
+.timeline{display:grid;grid-template-columns:110px 1fr 65px;gap:16px;align-items:center;margin:6px 0 16px}.clock{font-size:24px;font-variant-numeric:tabular-nums;font-weight:600}.time-end{text-align:right;color:var(--muted)}
+.toolbar{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin:12px 0}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px}.swatch{display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:-1px;margin-right:5px}
+.view-settings{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.compare{display:grid;grid-template-columns:1fr 1fr;gap:20px}.panel{background:white;border:1px solid var(--line);border-radius:10px;overflow:hidden}.panel-header{padding:15px 18px 6px}.case-subtitle{font-size:13px;color:var(--muted)}
+.metrics{display:flex;justify-content:space-between;gap:12px;padding:5px 18px 10px;flex-wrap:wrap}.metric{font-size:13px}.metric strong{font-size:23px;font-variant-numeric:tabular-nums;font-weight:600;display:block;line-height:1.3}
+.canvas-wrap{position:relative}.map{width:100%;height:auto;aspect-ratio:1.38;display:block;touch-action:none;cursor:grab}.map:active{cursor:grabbing}.map-label{margin:0;padding:0 18px 12px;font-size:12px;color:var(--muted)}
+.scale{display:flex;gap:12px;align-items:center;font-size:13px;flex-wrap:wrap;min-height:34px}.scale-bar{width:180px;height:10px;border-radius:2px;background:linear-gradient(to right,#fff,#087db4)}
+.help{font-size:13px;color:var(--muted);margin:9px 0}.detail{margin-top:14px;padding:12px 16px;border:1px solid var(--line);border-radius:8px;background:#fff}.detail-header{display:flex;gap:15px;justify-content:space-between;align-items:center}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:7px}
+.bars{display:flex;height:12px;margin:7px 0;border:1px solid #b9cbd4;background:#fff}.bars>span{height:100%}.cell-text{font-variant-numeric:tabular-nums;font-size:13px}.charts{display:grid;grid-template-columns:1fr 1fr;gap:26px;margin-top:22px}.chart{width:100%;height:215px;display:block;touch-action:none;cursor:crosshair}
+.finding{margin:20px 0 10px;border-left:3px solid var(--blue);padding:2px 16px}.finding p{margin:4px 0}
+details{border-top:1px solid var(--line);padding:14px 0;margin-top:14px}summary{cursor:pointer;font-weight:600}details p{max-width:1100px;margin:10px 0}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}th{font-weight:600}td.num{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow:auto}.foot{font-size:12px;color:var(--muted);margin-top:20px}.error{color:#a12d21;background:#fff0ec;padding:16px;border:1px solid #ddaa9c}
+@media(max-width:760px){main{padding:18px 14px}h1{font-size:23px}.compare,.charts,.detail-grid{grid-template-columns:1fr}.timeline{grid-template-columns:85px 1fr 50px;gap:8px}.clock{font-size:21px}.compare{gap:14px}.metrics{gap:8px}.toolbar{align-items:flex-start}.chart{height:200px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body><main>
+<header><div class="eyebrow">POREBRINE / 二维孔隙尺度数值实验</div>
+<h1>光卤石退缩之后，沉淀留在哪里？</h1>
+<p class="muted">饱和石盐水从左向右注入。两组采用相同初始岩石、溶液与压差，观察新矿物生成对溶蚀过程的影响。</p><p class="muted" id="numerical-status">探索性参数算例 · 展示计算结果，尚未完成网格与时间步收敛验证</p></header>
+<div id="load" role="status">正在读取内嵌计算结果…</div>
+<div id="app" hidden>
+<section id="front-audit" class="detail" hidden>
+<strong>机制修正：让新暴露的内部界面继续成核</strong>
+<p>上一版预先布置外层沉淀并关闭新成核，回答的是预涂层问题，不能用来判断动态矿物生成。这里从零石盐、零钾石盐开始；每一步根据当前湿润界面和局部过饱和状态，重新决定哪里可以成核。</p>
+<p id="front-current" class="cell-text"></p>
+<button id="locate-inner" type="button">定位内部新沉淀</button>
+<label><input type="checkbox" id="birth-markers"> 标出最近保存时段的新成核位置</label>
+</section>
+<div class="controls">
+<button id="play" class="primary" type="button">播放</button>
+<button id="previous" type="button" aria-label="上一保存帧">上一帧</button>
+<button id="next" type="button" aria-label="下一保存帧">下一帧</button>
+<label>播放速度 <select id="speed"><option value=".125">0.125×</option><option value=".25" selected>0.25×</option><option value=".5">0.5×</option><option value="1">1×</option></select></label>
+<button id="reset" type="button">聚焦岩石</button><button id="domain" type="button">整个区域</button>
+</div>
+<div class="timeline"><output id="clock" class="clock">0.00 s</output><input id="time" type="range" min="0" max="3" step=".001" value="0" aria-label="物理时间（秒）"><span id="end" class="time-end">3.00 s</span></div>
+<div class="toolbar"><div class="legend" aria-label="矿物图例">
+<span><i class="swatch" style="background:var(--rock)"></i>光卤石</span><span><i class="swatch" style="background:var(--blue)"></i>石盐</span><span><i class="swatch" style="background:var(--gold)"></i>钾石盐</span><span><i class="swatch" style="background:white;border:1px solid #adbdc7"></i>孔隙液体</span></div>
+<div class="view-settings"><label>查看 <select id="field"><option value="mixture">三种矿物混合</option><option value="0">光卤石体积分数</option><option value="1">石盐体积分数</option><option value="2">钾石盐体积分数</option><option value="4">附着微晶覆盖率</option><option value="7">石盐饱和指数 SI</option><option value="8">钾石盐饱和指数 SI</option></select></label>
+<label><input type="checkbox" id="grid"> 网格</label><label><input type="checkbox" id="flow"> 流速箭头</label></div></div>
+<div class="scale" id="scale" aria-live="polite"></div>
+<div class="compare">
+<section class="panel"><div class="panel-header"><h2>允许石盐、钾石盐沉淀</h2><div class="case-subtitle" id="representation">多矿物网格 · 可透水覆盖层</div></div>
+<div class="metrics"><div class="metric">光卤石剩余<strong id="remaining0"></strong></div><div class="metric">沉淀 / 初始岩石体积<strong id="products0"></strong></div></div>
+<div class="canvas-wrap"><canvas id="map0" class="map" role="img" aria-label="允许次生沉淀的二维矿物分布，拖动可平移，滚轮可缩放，点击查看网格"></canvas></div><p class="map-label">虚线圆：初始光卤石外缘　坐标单位：µm</p></section>
+<section class="panel"><div class="panel-header"><h2>只有光卤石溶解</h2><div class="case-subtitle">对照组 · 禁用其他矿物的成核与反应</div></div>
+<div class="metrics"><div class="metric">光卤石剩余<strong id="remaining1"></strong></div><div class="metric">沉淀 / 初始岩石体积<strong id="products1"></strong></div></div>
+<div class="canvas-wrap"><canvas id="map1" class="map" role="img" aria-label="只有光卤石溶解的二维矿物分布，与左图时间和缩放同步"></canvas></div><p class="map-label">虚线圆：初始光卤石外缘　坐标单位：µm</p></section></div>
+<p class="help">拖动时间轴或下方曲线可回看；拖动任一矿物图同步平移，滚轮缩放，点击网格查看成分。<span id="frame-info"></span></p>
+<section class="detail" aria-label="选中网格详情"><div class="detail-header"><strong id="cell-title">点击矿物图，查看同一位置的网格</strong><button id="clear" type="button">清除选择</button></div><div id="cell-detail" class="detail-grid"><p class="muted">同一网格可以同时包含光卤石、石盐、钾石盐及液体。</p></div></section>
+<div class="charts"><section><h3>光卤石剩余体积 / 初始体积</h3><canvas id="history" class="chart" role="img" aria-label="两组光卤石剩余百分比随时间变化的曲线"></canvas><div class="legend"><span><i class="swatch" style="background:#087db4"></i>允许沉淀</span><span><i class="swatch" style="background:#4d555e"></i>只有溶解</span></div></section>
+<section><h3>沉淀体积 / 初始岩石体积</h3><canvas id="precip" class="chart" role="img" aria-label="沉淀案例中石盐与钾石盐的体积百分比随时间变化的曲线"></canvas><div class="legend"><span><i class="swatch" style="background:#087db4"></i>石盐</span><span><i class="swatch" style="background:#bd7100"></i>钾石盐</span><span class="muted">钾石盐较少，可切换上方单矿物视图</span></div></section></div>
+<section class="finding"><p id="result"></p><p>两组差异包含溶液化学、沉淀占据孔隙、界面几何与覆盖层传质的共同作用；仅凭这两组，不能确定表面覆盖的抑制强度。</p><p id="mechanism"></p><p id="withdrawn-result"></p></section>
+<details open><summary>如何理解图中的“覆盖”和混合网格</summary>
+<p>图像显示求解器保存的网格平均体积分数。混合视图按各相体积与液体加权混色；不是每一颗晶体的真实位置或形状。单矿物视图采用固定的非线性色标，增强少量沉淀的可见性，数值可点击网格查询。两个案例始终采用相同色标。</p>
+<p id="population-explanation"></p>
+<p>“附着微晶覆盖率”只计仍与光卤石接触的沉淀群体，不能代表残余沉淀造成的全部传输阻力。此处没有求解晶粒运动、破裂或力学脱落。</p>
+<div id="front-method" hidden>
+<p><strong>必须闭合的过程：</strong>连通液体接触光卤石 → 光卤石溶解并释放 K、Mg、Cl 和结晶水 → 更新局部离子活度与饱和指数 → 新表面成核、已有晶体生长或再溶解 → 更新孔隙、界面与传质 → 下一步。初始外缘不是永久的沉淀位置；未被液体接触的致密内部也不能直接反应。</p>
+<p>SI = log₁₀(IAP/K)。NaCl 的 IAP = aNa·aCl，KCl 的 IAP = aK·aCl，光卤石的 IAP = aK·aMg·aCl³·aw⁶。每个矿物分别判断驱动力；释放了 K 并不意味着 KCl 必然立即沉淀。成核事件在当前未覆盖的光卤石表面按 J(SI)·A·Δt 采样，晶核消耗对应离子并占据真实固相体积。</p>
+<p><strong>本次验证的范围：</strong>新暴露位置能从零产物开始成核，旧产物留在生成位置，新旧产物都能继续反应。模型目前只启用光卤石表面的异相成核；没有启用溶液中均相成核，也没有启用石盐与钾石盐之间的交叉成核。</p>
+<p><strong>尚未解决的机制：</strong>成核使用接收网格的液体平均化学状态，未为每个被覆盖界面同时求解多矿物反应的独立薄液膜组成。覆盖面积由晶体群体矩和几何接触假设估计，不能仅凭体积分数确定真实接触拓扑、贯通膜、裂隙或脱落。本页证明“可以向内部新生”，不证明覆盖阻碍强度已经可信。</p>
+<p>2024 年原论文采用演化的流固界面描述耦合反应，并将成核和覆盖阻碍列为后续研究；这两部分需要额外的机制模型。<a href="https://doi.org/10.1029/2023WR036122" target="_blank" rel="noreferrer">Wang、Hu 与 Steefel，2024</a>。</p>
+<p>内部统计采用初始光卤石体积分数 > 0.9999 的网格；深度按网格中心距初始半径 40 µm 的外缘计算，显示阈值为该产物体积分数 > 10⁻⁶。成核标记来自相邻保存帧的累计事件数差值，不对事件作时间插值。</p>
+</div>
+</details>
+<details id="morphology-section" hidden><summary>上版石盐长条的原因与本次修订</summary>
+<p>上版把达到尺寸阈值的微晶群体转换成网格内的平面界面。少量石盐跨入相邻网格后，这种重构可以生成横贯网格的生长面，再激活后续网格，形成对角线长条。体积守恒并不能排除这种界面面积与空间位置的错误。</p>
+<p>本次采用原位沉淀群体近似：分别计算石盐、钾石盐的质量、体积、群体反应面积，以及对光卤石的覆盖和传质阻力，停用上述平面转换。下面均为重新求解后的原始体积分数，未做平滑或空间过滤。这通过改变沉淀表示方式排除了本实验中的条纹通道，尚未实现可信的跨网格单晶前沿追踪。</p>
+<p id="morphology-numbers"></p><img id="morphology-image" style="display:block;width:100%;height:auto" alt="相同线性色标下，上版石盐长条与两种网格的原位沉淀群体结果对比">
+</details>
+<details><summary>实验条件、数值检查与结果适用范围</summary>
+<div id="conditions"></div><div class="table-wrap"><table id="validation"><thead><tr><th>计算</th><th>网格</th><th>时间步 / s</th><th>结束 / s</th><th>光卤石溶解</th><th>石盐 / mol</th><th>钾石盐 / mol</th><th>组分平衡误差</th></tr></thead><tbody></tbody></table></div>
+<p>这是机制探索算例。反应速率、成核参数、接触角与覆盖层性质尚未用该盐水体系的实验标定；结果支持进一步研究这一方向，不直接给出真实岩石的反应时间预测。质量守恒通过不等于网格与时间步已经收敛。</p>
+<p>成核按网格采样；改变网格也会改变成核位置和事件序列，固定随机种子不等于同一个物理随机实现。本次加密比较包含这种变化，尚未进行多随机种子的统计。</p>
+<p id="validation-note"></p><p id="data-note"></p>
+</details>
+<p class="foot">Porebrine 原生化学与流动求解器输出 · 数据已嵌入本页，可离线打开 · 25 °C，恒定黏度，未求解能量方程</p>
+</div>
+<script id="simulation" type="application/json">__SIMULATION_DATA__</script>
+<script>
+"use strict";
+(async()=>{
+const $=id=>document.getElementById(id), payload=JSON.parse($("simulation").textContent), cases=payload.cases;
+for(const c of cases){
+  const bytes=Uint8Array.from(atob(c.data),x=>x.charCodeAt(0));
+  const stream=new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  c.array=new Float32Array(await new Response(stream).arrayBuffer());
+  if(c.array.length!==c.values)throw Error("内嵌数据长度不正确");
+  c.stride=c.channels.length;c.count=c.nx*c.ny;delete c.data;
+}
+const end=cases[0].times.at(-1), COLORS=[[77,85,94],[8,125,180],[189,113,0]], initialRemaining=100;
+let t=0,playing=false,prior=0,selection=null,view={cx:120,cy:100,width:150},drag=null;
+const maps=[$("map0"),$("map1")], plotGeometry=new Map();
+const fmt=(x,n=2)=>Number(x).toFixed(n),pct=x=>fmt(x*100,3)+"%", clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+const si=x=>x<=-90?"未定义":fmt(x,2);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function bracket(times,time){let i=0;while(i+1<times.length&&times[i+1]<time-1e-10)i++;const j=Math.min(i+1,times.length-1),f=i===j?0:clamp((time-times[i])/(times[j]-times[i]),0,1);return[i,j,f];}
+function value(c,cell,ch,time=t){if(c.cachedTime!==time){c.cachedTime=time;c.cachedBracket=bracket(c.times,time);}const [a,b,f]=c.cachedBracket,i=(a*c.count+cell)*c.stride+ch,j=(b*c.count+cell)*c.stride+ch;return c.array[i]*(1-f)+c.array[j]*f;}
+function savedIndex(c){let i=0;while(i+1<c.times.length&&c.times[i+1]<=t+1e-8)i++;return i;}
+function births(c,cell,product){const i=savedIndex(c);return i===0?0:c.array[(i*c.count+cell)*c.stride+13+product]-c.array[((i-1)*c.count+cell)*c.stride+13+product];}
+function curve(c,ch,time=t){const rows=c.curves;let i=0;while(i+1<rows.length&&rows[i+1][0]<time)i++;const j=Math.min(i+1,rows.length-1),f=i===j?0:clamp((time-rows[i][0])/(rows[j][0]-rows[i][0]),0,1);return rows[i][ch]*(1-f)+rows[j][ch]*f;}
+function setup(canvas){const r=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1,w=r.width,h=r.height;if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);}const g=canvas.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);return[g,w,h];}
+function mapGeometry(w,h){const left=43,top=15,pw=w-left-12,ph=h-top-30,s=Math.min(pw/view.width,ph/(view.width*.85)),x0=view.cx-pw/(2*s),y0=view.cy-ph/(2*s);return{left,top,pw,ph,s,x0,y0,x:x=>left+(x-x0)*s,y:y=>top+ph-(y-y0)*s};}
+function axis(g,w,h,m){g.strokeStyle="#bacbd3";g.lineWidth=1;g.strokeRect(m.left,m.top,m.pw,m.ph);g.fillStyle="#536b77";g.font='11px "Segoe UI","Microsoft YaHei",sans-serif';g.textAlign="center";let step=view.width<70?10:view.width<180?25:50;for(let x=Math.ceil(m.x0/step)*step;x<=m.x0+view.width;x+=step){if(x<0||x>320)continue;g.fillText(fmt(x,0),m.x(x),h-9);}g.textAlign="right";for(let y=Math.ceil(m.y0/step)*step;y<=m.y0+m.ph/m.s;y+=step){if(y<0||y>200)continue;g.fillText(fmt(y,0),m.left-7,m.y(y)+4);}}
+function color(c,cell,mode){
+  if(mode==="mixture"){const p=[0,1,2].map(j=>value(c,cell,j));const fluid=clamp(1-p.reduce((a,b)=>a+b,0),0,1);return COLORS[0].map((_,k)=>Math.round(clamp(255*fluid+p.reduce((sum,v,j)=>sum+v*COLORS[j][k],0),0,255)));}
+  const ch=Number(mode);
+  if(ch===7||ch===8){const raw=value(c,cell,ch);if(value(c,cell,3)<.001||raw<=-90)return [245,245,245];const f=clamp(Math.abs(raw)/.5,0,1),base=raw<0?[184,196,201]:COLORS[ch===7?1:2];return base.map(x=>Math.round(255+(x-255)*f));}
+  const v=clamp(value(c,cell,ch),0,1),max=Math.max(...cases.map(k=>k.maxima[ch]),1e-12);
+  let f=ch===0||ch===4?v:Math.log1p(v/1e-5)/Math.log1p(max/1e-5);
+  const base=ch===4?[148,42,139]:COLORS[ch];
+  if(ch===4&&value(c,cell,12)<=0)f=0;
+  return base.map(x=>Math.round(255+(x-255)*f));
+}
+function drawMap(c,canvas){
+  const[g,w,h]=setup(canvas),m=mapGeometry(w,h);plotGeometry.set(canvas,m);
+  g.fillStyle="#fff";g.fillRect(0,0,w,h);g.save();g.beginPath();g.rect(m.left,m.top,m.pw,m.ph);g.clip();
+  g.fillStyle="#edf3f6";g.fillRect(m.left,m.top,m.pw,m.ph);g.fillStyle="#fff";g.fillRect(m.x(0),m.y(200),320*m.s,200*m.s);
+  const mode=$("field").value;
+  for(let iy=0;iy<c.ny;iy++)for(let ix=0;ix<c.nx;ix++){
+    const x=m.x(ix*c.dx),y=m.y((iy+1)*c.dx),size=c.dx*m.s;
+    if(x+size<m.left||x>m.left+m.pw||y+size<m.top||y>m.top+m.ph)continue;
+    const dpr=window.devicePixelRatio||1,x1=Math.round(x*dpr)/dpr,y1=Math.round(y*dpr)/dpr,x2=Math.round((x+size)*dpr)/dpr,y2=Math.round((y+size)*dpr)/dpr;
+    g.fillStyle="rgb("+color(c,iy*c.nx+ix,mode).join(",")+")";g.fillRect(x1,y1,x2-x1,y2-y1);
+    if($("grid").checked&&size>5){g.strokeStyle="rgba(50,75,90,.13)";g.lineWidth=.5;g.strokeRect(x,y,size,size);}
+  }
+  if(payload.mechanismAudit&&$("birth-markers").checked){
+    for(let cell=0;cell<c.count;cell++)for(let product=0;product<2;product++)if(births(c,cell,product)>0){
+      const ix=cell%c.nx,iy=Math.floor(cell/c.nx),x=m.x((ix+.5)*c.dx)+(product?2:-2),y=m.y((iy+.5)*c.dx);
+      g.lineWidth=1.8;g.strokeStyle=product?"#bd7100":"#087db4";g.beginPath();g.moveTo(x-3,y);g.lineTo(x+3,y);g.moveTo(x,y-3);g.lineTo(x,y+3);g.stroke();
+    }
+  }
+  if($("flow").checked){
+    const stride=Math.max(2,Math.round(22/(c.dx*m.s)));
+    g.strokeStyle="rgba(23,71,98,.55)";g.lineWidth=1;
+    let umax=0;for(let cell=0;cell<c.count;cell++)umax=Math.max(umax,Math.hypot(value(c,cell,10),value(c,cell,11)));
+    for(let iy=1;iy<c.ny;iy+=stride)for(let ix=1;ix<c.nx;ix+=stride){
+      const cell=iy*c.nx+ix;if(value(c,cell,3)<.2)continue;
+      const ux=value(c,cell,10),uy=value(c,cell,11),speed=Math.hypot(ux,uy);if(speed<umax*.01)continue;
+      const length=19*speed/Math.max(umax,1e-30),x=m.x((ix+.5)*c.dx),y=m.y((iy+.5)*c.dx),vx=ux/speed,vy=-uy/speed;
+      const ex=x+vx*length,ey=y+vy*length;g.beginPath();g.moveTo(x,y);g.lineTo(ex,ey);g.lineTo(ex-4*vx+2*vy,ey-4*vy-2*vx);g.moveTo(ex,ey);g.lineTo(ex-4*vx-2*vy,ey-4*vy+2*vx);g.stroke();
+    }
+  }
+  g.setLineDash([4,4]);g.strokeStyle="#758b98";g.lineWidth=1;g.beginPath();g.arc(m.x(120),m.y(100),40*m.s,0,2*Math.PI);g.stroke();g.setLineDash([]);
+  if(selection){g.strokeStyle="#bb2255";g.lineWidth=2;g.strokeRect(m.x(selection.ix*c.dx),m.y((selection.iy+1)*c.dx),c.dx*m.s,c.dx*m.s);}
+  g.restore();axis(g,w,h,m);g.fillStyle="rgba(255,255,255,.9)";g.fillRect(m.left+5,m.top+5,82,21);g.fillStyle="#395765";g.font='12px "Segoe UI",sans-serif';g.textAlign="left";g.fillText("t = "+fmt(t,2)+" s",m.left+10,m.top+20);
+}
+function drawChart(canvas,kind){
+  const[g,w,h]=setup(canvas),left=42,right=12,top=12,bottom=29,pw=w-left-right,ph=h-top-bottom;
+  const max=kind==="history"?initialRemaining:Math.max(1,...cases[0].curves.map(r=>r[2]+r[3]))*1.12;
+  const x=v=>left+v/end*pw,y=v=>top+ph-v/max*ph;
+  g.font='11px "Segoe UI","Microsoft YaHei",sans-serif';g.textAlign="right";
+  for(let i=0;i<=4;i++){const v=max*i/4;g.strokeStyle="#dce6eb";g.beginPath();g.moveTo(left,y(v));g.lineTo(w-right,y(v));g.stroke();g.fillStyle="#536b77";g.fillText(fmt(v,max<10?1:0)+"%",left-7,y(v)+4);}
+  g.textAlign="center";for(let i=0;i<=4;i++){g.fillText(fmt(end*i/4,2),x(end*i/4),h-8);}g.textAlign="right";g.fillText("s",w-1,h-8);
+  const series=kind==="history"?[[cases[0],1,"#087db4"],[cases[1],1,"#4d555e"]]:[[cases[0],2,"#087db4"],[cases[0],3,"#bd7100"]];
+  for(const[c,ch,col]of series){g.strokeStyle=col;g.lineWidth=2;g.beginPath();c.curves.forEach((r,i)=>i?g.lineTo(x(r[0]),y(r[ch])):g.moveTo(x(r[0]),y(r[ch])));g.stroke();g.fillStyle=col;g.beginPath();g.arc(x(t),y(curve(c,ch)),3.5,0,2*Math.PI);g.fill();}
+  g.strokeStyle="#8097a3";g.lineWidth=1;g.setLineDash([3,3]);g.beginPath();g.moveTo(x(t),top);g.lineTo(x(t),top+ph);g.stroke();g.setLineDash([]);
+  plotGeometry.set(canvas,{left,pw});
+}
+function cellDetail(){
+  if(!selection)return;const{ix,iy}=selection,c=cases[0],index=iy*c.nx+ix;
+  $("cell-title").textContent=`网格 (${ix+1}, ${iy+1}) · 中心 (${fmt((ix+.5)*c.dx,1)}, ${fmt((iy+.5)*c.dx,1)}) µm · ${fmt(t,3)} s`;
+  $("cell-detail").innerHTML=cases.map(c=>{
+    const p=[0,1,2,3].map(j=>value(c,index,j)),ph=p[1],ps=p[2],sh=value(c,index,5),ss=value(c,index,6);
+    return `<div><strong>${esc(c.label)}</strong><div class="bars" aria-label="选中网格的矿物与液体体积分数">${p.map((v,j)=>`<span style="width:${v*100}%;background:${j===3?"white":"rgb("+COLORS[j].join(",")+")"}"></span>`).join("")}</div>
+    <div class="cell-text">光卤石 ${pct(p[0])} · 石盐 ${pct(ph)} · 钾石盐 ${pct(ps)} · 液体 ${pct(p[3])}</div>
+    <div class="cell-text muted">亚网格石盐 ${pct(sh)} / 已解析 ${pct(Math.max(0,ph-sh))}<br>亚网格钾石盐 ${pct(ss)} / 已解析 ${pct(Math.max(0,ps-ss))}<br>附着微晶覆盖率 ${value(c,index,12)>0?pct(value(c,index,4)):"—（无光卤石支撑面）"}<br>饱和指数 SI：石盐 ${si(value(c,index,7))}，钾石盐 ${si(value(c,index,8))}（正值为过饱和）${payload.mechanismAudit?`<br>初始光卤石 ${pct(value(c,index,0,0))}<br>最近保存时段新核：石盐 ${births(c,index,0)}，钾石盐 ${births(c,index,1)}`:""}</div></div>`;
+  }).join("");
+}
+function scaleLabel(){
+  const mode=$("field").value;if(mode==="mixture"){$("scale").textContent="体积分数加权混色 · 液体越多，颜色越浅 · 饱和 NaCl 水 →";return;}
+  if(mode==="7"||mode==="8"){$("scale").textContent="SI 色标：灰色 ≤ −0.5（欠饱和）— 白色 0 — 矿物颜色 ≥ +0.5（过饱和）；干固体不显示 SI。";return;}
+  const ch=Number(mode),col=ch===4?"#942a8b":["#4d555e","#087db4","#bd7100"][ch],max=ch===0||ch===4?1:Math.max(...cases.map(c=>c.maxima[ch]));
+  $("scale").innerHTML=`<span>0</span><span class="scale-bar" style="background:linear-gradient(to right,white,${col})"></span><span>${pct(max)}</span><span class="muted">${ch===1||ch===2?"对数增强：log(1 + 体积分数 / 10⁻⁵)":"线性色标"}${ch===4?" · 仅附着亚网格晶核，不含全部固相遮挡":""}</span>`;
+}
+function render(){
+  $("clock").textContent=fmt(t,2)+" s";$("time").value=t;
+  const[a,b,f]=bracket(cases[0].times,t),exact=f<1e-7||f>1-1e-7;
+  $("frame-info").textContent=exact?"当前为保存帧。":`当前显示 ${fmt(cases[0].times[a],2)}–${fmt(cases[0].times[b],2)} s 帧间线性插值，仅用于播放。`;
+  cases.forEach((c,i)=>{$("remaining"+i).textContent=fmt(curve(c,1),1)+"%";$("products"+i).textContent=fmt(curve(c,2)+curve(c,3),2)+"%";drawMap(c,maps[i]);});
+  if(payload.mechanismAudit){const c=cases[0],i=savedIndex(c),r=c.front[i];$("front-current").textContent=`截至保存时刻 ${fmt(r.time_s,2)} s，初始完全被光卤石占据的区域中：石盐 ${fmt(r.inner_volume_um3_Halite,1)} µm³ / ${r.inner_births_Halite} 次成核；钾石盐 ${fmt(r.inner_volume_um3_Sylvite,2)} µm³ / ${r.inner_births_Sylvite} 次成核。最深含沉淀网格中心距初始外缘 ${fmt(Math.max(r.maximum_inward_cell_centre_um_Halite,r.maximum_inward_cell_centre_um_Sylvite),1)} µm。`;}
+  drawChart($("history"),"history");drawChart($("precip"),"precip");cellDetail();
+}
+function setTime(v){t=clamp(v,0,end);render();}
+function stop(){playing=false;$("play").textContent="播放";}
+function animate(now){if(playing){if(prior)t+=Math.min((now-prior)/1000,.1)*Number($("speed").value);if(t>=end){t=end;stop();}render();}prior=now;requestAnimationFrame(animate);}
+$("play").onclick=()=>{if(playing)stop();else{if(t>=end)t=0;playing=true;$("play").textContent="暂停";prior=performance.now();}};
+$("time").addEventListener("input",e=>{stop();setTime(Number(e.target.value));});
+$("previous").onclick=()=>{stop();setTime([...cases[0].times].reverse().find(v=>v<t-1e-7)??0);};
+$("next").onclick=()=>{stop();setTime(cases[0].times.find(v=>v>t+1e-7)??end);};
+$("reset").onclick=()=>{view={cx:120,cy:100,width:150};render();};
+$("domain").onclick=()=>{view={cx:160,cy:100,width:340};render();};
+$("clear").onclick=()=>{selection=null;$("cell-title").textContent="点击矿物图，查看同一位置的网格";$("cell-detail").innerHTML='<p class="muted">同一网格可以同时包含光卤石、石盐、钾石盐及液体。</p>';render();};
+$("field").onchange=()=>{scaleLabel();render();};$("grid").onchange=render;$("flow").onchange=render;
+$("birth-markers").onchange=render;
+$("locate-inner").onclick=()=>{const c=cases[0];let best=-1,score=0;for(let i=0;i<c.count;i++)if(value(c,i,0,0)>.9999&&value(c,i,2,end)>score){best=i;score=value(c,i,2,end);}if(best>=0){selection={ix:best%c.nx,iy:Math.floor(best/c.nx)};stop();$("field").value="2";scaleLabel();setTime(end);$("map0").scrollIntoView({block:"center"});}};
+for(const canvas of maps){
+  canvas.addEventListener("wheel",e=>{e.preventDefault();const m=plotGeometry.get(canvas),r=canvas.getBoundingClientRect(),x=m.x0+(e.clientX-r.left-m.left)/m.s,y=m.y0+(m.top+m.ph-e.clientY+r.top)/m.s;
+    const ratio=clamp(view.width*Math.exp(e.deltaY*.0015),30,500)/view.width;view={width:view.width*ratio,cx:x+(view.cx-x)*ratio,cy:y+(view.cy-y)*ratio};render();},{passive:false});
+  canvas.addEventListener("pointerdown",e=>{canvas.setPointerCapture(e.pointerId);drag={canvas,x:e.clientX,y:e.clientY,cx:view.cx,cy:view.cy,m:plotGeometry.get(canvas),moved:false};});
+  canvas.addEventListener("pointermove",e=>{if(!drag||drag.canvas!==canvas)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;if(Math.hypot(dx,dy)>4)drag.moved=true;if(drag.moved){view.cx=drag.cx-dx/drag.m.s;view.cy=drag.cy+dy/drag.m.s;render();}});
+  canvas.addEventListener("pointerup",e=>{if(!drag)return;if(!drag.moved){const m=plotGeometry.get(canvas),r=canvas.getBoundingClientRect(),x=m.x0+(e.clientX-r.left-m.left)/m.s,y=m.y0+(m.top+m.ph-e.clientY+r.top)/m.s,c=cases[0];
+    if(x>=0&&x<320&&y>=0&&y<200)selection={ix:Math.floor(x/c.dx),iy:Math.floor(y/c.dx)};}drag=null;render();});
+  canvas.addEventListener("pointercancel",()=>{drag=null;});
+}
+for(const canvas of[$("history"),$("precip")]){
+  let active=false;const seek=e=>{const m=plotGeometry.get(canvas),r=canvas.getBoundingClientRect();stop();setTime((e.clientX-r.left-m.left)/m.pw*end);};
+  canvas.onpointerdown=e=>{canvas.setPointerCapture(e.pointerId);active=true;seek(e);};canvas.onpointermove=e=>{if(active)seek(e);};canvas.onpointerup=()=>{active=false;};canvas.onpointercancel=()=>{active=false;};
+}
+const a=cases[0].summary,b=cases[1].summary,settings=cases[0].settings;
+const retained=settings["advanced.nucleusResolutionModel"]==="population";
+$("population-explanation").textContent=retained?
+  "各矿物分别保存质量与体积，孔隙率由 1 − 各固相体积分数之和计算。本版中，光卤石界面继续退缩；次生沉淀保留在发生过成核的网格内，以群体的体积和反应面积表示，光卤石退缩后可作为残余产物继续反应。没有把小体积沉淀强制转换成横贯网格的平面，也没有解析单颗晶体向邻格伸展的形状。":
+  "各矿物分别保存质量与体积，孔隙率由 1 − 各固相体积分数之和计算。本数据使用旧版微晶尺寸阈值到 PLIC 平面的转换；该转换可能引入虚假的跨网格长条，形貌不应当作真实晶体形状。";
+if(retained)$("representation").textContent="原位沉淀群体 · 多矿物网格 · 可透水覆盖";
+if(payload.morphology){
+  $("morphology-section").hidden=false;$("morphology-section").open=true;
+  $("morphology-image").src=payload.morphology.image;
+  const old=payload.morphology.final.find(r=>r.representation==="plic"),
+        revised=payload.morphology.final.find(r=>r.run===cases[0].id);
+  if(old&&revised)$("morphology-numbers").textContent=`以石盐体积分数 > 10⁻⁶ 计：在 ${fmt(end,2)} s，上版距岩石中心超过 55 µm 的含石盐网格有 ${old.Halite_cells_beyond_55um} 个，修订后为 ${revised.Halite_cells_beyond_55um} 个。修订后所有含石盐网格均有当地成核记录，且石盐体积全部保留在群体账本中。初始岩石半径为 40 µm；上述统计用于检查本近似的实现，不代表真实沉淀不能向外生长。`;
+  const legacy=payload.morphology.legacySummary;
+  if(legacy)$("withdrawn-result").textContent=`更正：上版得到光卤石溶解 ${fmt(legacy.Carnallite_dissolved_fraction*100,1)}%，但其石盐界面存在条纹伪影，该数值不再用于判断覆盖阻滞。修订后为 ${fmt(a.Carnallite_dissolved_fraction*100,1)}%，仍需结合下面的分辨率比较判断可信程度。`;
+}
+$("result").textContent=`到 ${fmt(end,2)} s，允许沉淀时光卤石溶解 ${fmt(a.Carnallite_dissolved_fraction*100,1)}%，只有溶解时为 ${fmt(b.Carnallite_dissolved_fraction*100,1)}%。净沉淀体积约为光卤石损失体积的 ${fmt(a.precipitate_to_removed_volume_ratio*100,1)}%；存在 ${a.mixed_cells_final} 个混合矿物网格，其中 ${a.three_mineral_cells_final} 个包含三种矿物（各相体积分数 > 10⁻⁶）。`;
+$("conditions").innerHTML=`<p>计算区域 320 × 200 µm，等效厚度 20 µm；初始光卤石半径 40 µm，中心 (120, 100) µm；网格 ${cases[0].nx} × ${cases[0].ny}，间距 ${fmt(cases[0].dx,2)} µm。左侧注入、右侧流出，上下为壁面；压差 0.02 Pa，恒定黏度 0.0018 Pa·s，扩散系数 10⁻⁹ m²/s。</p>
+<p>初始孔隙水与入口均为 25 °C 饱和 NaCl 水，原生 Pitzer 模型求得 NaCl ${fmt(Number(settings["initial_solution_mol_kg_water.Na"]),6)} mol/kg 自由水。光卤石 / 石盐 / 钾石盐速率系数分别为 0.05 / 0.02 / 0.01 mol/(m²·s)。成核前因子 10¹¹ m⁻²·s⁻¹，有效成核势垒 0.02，接触角 60°，初始晶核半径 100 nm，随机种子 2024；覆盖层孔隙率 0.35，曲折度 2。晶核参数属于本算例设定。</p>`;
+const rows=[...cases.map(c=>c.summary),...payload.validation],names={porous:"允许沉淀 / 可透水覆盖",dissolution_only:"只有光卤石",precipitation_unblocked:"允许沉淀 / 关闭附加表面阻力",impermeable:"允许沉淀 / 不透水覆盖"};
+$("validation").querySelector("tbody").innerHTML=rows.map(r=>`<tr><td>${esc(names[r.mode]||r.run)}<br><small>${esc(r.run)}</small></td><td>${r.nx} × ${r.ny}</td><td>${r.time_step_s}</td><td>${fmt(r.end_time_s,2)}</td><td>${fmt(100*r.Carnallite_dissolved_fraction,2)}%</td><td>${r.final_Halite_mol.toExponential(3)}</td><td>${r.final_Sylvite_mol.toExponential(3)}</td><td>${r.mass_balance_error_max.toExponential(2)}</td></tr>`).join("");
+$("validation-note").textContent=payload.validation.length?"上表同时列出已完成的补充计算。空间分辨率改变时，局部混合、成核采样与界面面积也可能变化，需结合各指标判断收敛。":"本页只展示已完整完成并通过守恒检查的两个主案例，尚未据此认定网格或时间步收敛。";
+const fine=payload.validation.find(r=>r.mode==="porous"&&r.nx>a.nx),half=payload.validation.find(r=>r.mode==="porous"&&r.nx===a.nx&&r.time_step_s<a.time_step_s);
+if(fine||half){
+  const checks=[];
+  if(half)checks.push(`时间步减半：光卤石溶解量改变 ${fmt(Math.abs(half.Carnallite_dissolved_fraction-a.Carnallite_dissolved_fraction)*100,2)} 个百分点，石盐量改变 ${fmt(Math.abs(half.final_Halite_mol/a.final_Halite_mol-1)*100,1)}%，钾石盐量改变 ${fmt(Math.abs(half.final_Sylvite_mol/a.final_Sylvite_mol-1)*100,1)}%`);
+  if(fine)checks.push(`网格间距减半：光卤石溶解量改变 ${fmt(Math.abs(fine.Carnallite_dissolved_fraction-a.Carnallite_dissolved_fraction)*100,2)} 个百分点，石盐量改变 ${fmt(Math.abs(fine.final_Halite_mol/a.final_Halite_mol-1)*100,1)}%，钾石盐量改变 ${fmt(Math.abs(fine.final_Sylvite_mol/a.final_Sylvite_mol-1)*100,1)}%`);
+  $("validation-note").textContent=checks.join("；")+"。这是一次加密比较，尚不足以证明渐近收敛；微量产物与细部形态尤其需要继续验证。";
+}
+const noBarrier=payload.validation.find(r=>r.mode==="precipitation_unblocked"),sealed=payload.validation.find(r=>r.mode==="impermeable");
+if(noBarrier)$("mechanism").textContent=`补充机制对照：仍计算沉淀体积及其几何变化、关闭附加表面阻力时，光卤石溶解 ${fmt(noBarrier.Carnallite_dissolved_fraction*100,1)}%；可透水覆盖时为 ${fmt(a.Carnallite_dissolved_fraction*100,1)}%${sealed?`，不透水覆盖极端设定下为 ${fmt(sealed.Carnallite_dissolved_fraction*100,1)}%`:""}。这些是不同覆盖假设的敏感性计算，未把真实沉淀层预设为完全封闭。`;
+if(fine||half)$("numerical-status").textContent=(retained?"修订版：原位沉淀群体近似 · ":"")+"已做加密比较，结果仍有分辨率依赖，尚未证明网格与时间步独立";
+$("data-note").textContent=`每组 ${cases[0].times.length} 个保存帧；帧间只对显示值作线性插值。曲线使用保存时刻的全域积分记录；地图为 float32 保存场。主案例最大组分平衡相对误差 ${Math.max(a.mass_balance_error_max,b.mass_balance_error_max).toExponential(2)}，最终相体积闭合误差 ${Math.max(a.phase_volume_closure_error,b.phase_volume_closure_error).toExponential(2)}。`;
+if(payload.mechanismAudit){
+  $("front-audit").hidden=false;$("front-method").hidden=false;
+  $("numerical-status").textContent="零初始沉淀 · 当前湿润界面持续成核 · 本次检查机制，不作加密比较";
+  const r=cases[0].front.at(-1);
+  $("mechanism").textContent=`到 ${fmt(end,2)} s，${fmt(r.inner_volume_um3_Halite/r.volume_um3_Halite*100,1)}% 的石盐和 ${fmt(r.inner_volume_um3_Sylvite/r.volume_um3_Sylvite*100,1)}% 的钾石盐位于初始完全是光卤石的网格中。这直接排除了“只允许初始外表面沉淀”的限制。它尚不能证明覆盖形态和反应阻滞预测正确。`;
+  $("withdrawn-result").textContent="上一轮三种预涂层的结果不再用于解释新矿物在哪里生成，也不用于判定动态覆盖抑制强度。";
+  $("validation-note").textContent="本次只检验动态成核路径：零初始产品、相同初始岩石与入口、原内部网格发生溶解后才出现新核、对照没有次生矿物、质量与相体积守恒。没有新增网格或时间步加密计算。";
+}
+$("time").max=end;$("end").textContent=fmt(end,2)+" s";$("load").hidden=true;$("app").hidden=false;scaleLabel();render();new ResizeObserver(()=>render()).observe($("app"));requestAnimationFrame(animate);
+})().catch(error=>{document.getElementById("load").className="error";document.getElementById("load").textContent="无法读取内嵌数据："+error.message+"。请使用支持 DecompressionStream 的新版 Edge、Chrome 或 Firefox。";console.error(error);});
+</script>
+</main></body></html>
